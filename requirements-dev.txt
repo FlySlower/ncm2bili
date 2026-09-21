@@ -1,8 +1,6 @@
-httpx
-pydantic
-cryptography
-pyyaml
-playwright
-pytest
-pytest-asyncio
-respx
+-r requirements.txt
+pytest>=8.0
+pytest-asyncio>=0.23
+pytest-cov>=5.0
+respx>=0.21
+ruff>=0.4

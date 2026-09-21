@@ -1,18 +1,29 @@
-# 虚拟环境
+# 凭证与数据 —— 严禁入库（文档 §9.4）
+credentials.db
+cache.db
+cookie.txt
+manual.json
+
+# 运行产物
+logs/
+output/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
 .venv/
 venv/
+.pytest_cache/
+.coverage
+htmlcov/
 
-# Python 缓存
-__pycache__/
-*.pyc
-*.pyo
-
-# 运行时数据（含敏感信息，绝不提交）
-cache.db
-credentials.db
-output/
-logs/
-
-# IDE 配置
+# IDE
 .idea/
 .vscode/
+*.iml
+
+# 系统
+.DS_Store
+Thumbs.db
