@@ -1,0 +1,64 @@
+# ncm2bili 配置文件 —— 所有参数均有默认值，此处列出可调项
+# 对应技术文档 v0.3 §7 / §8
+
+# ---- 限速与并发（文档 §7 预防层）----
+rate_limit:
+  search:
+    concurrency: 4          # 搜索并发
+    interval_ms: 400        # 基础间隔
+    jitter_ms: [100, 300]   # 随机抖动范围
+  fav:
+    concurrency: 2          # 收藏并发（写操作更保守）
+    interval_ms: 500
+    jitter_ms: [100, 200]
+  stage2:                   # 阶段二补查（详情/粉丝数）
+    concurrency: 4
+    interval_ms: 400
+    jitter_ms: [100, 300]
+
+# ---- 风控响应层（文档 §7 响应层）----
+risk_control:
+  retry:
+    initial_delay_s: 2      # 单请求指数退避初值
+    backoff_factor: 2
+    max_retries: 3          # 412/网络错误最多重试 3 次
+  circuit_breaker:
+    window_s: 60            # 全局熔断滑动窗口
+    threshold_warn: 3       # 窗口内 -412 达 3 次 → 暂停 60s
+    pause_warn_s: 60
+    threshold_critical: 5   # 达 5 次 → 暂停 5min + 降并发 50%
+    pause_critical_s: 300
+    concurrency_cut: 0.5
+
+# ---- 身份层（文档 §7：启动时随机选一个，全程固定，严禁中途切换）----
+http:
+  user_agents:
+    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    - "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    - "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+  timeout_s: 15
+  referer: "https://www.bilibili.com"
+
+# ---- 评分权重（文档 §4.2）----
+scoring:
+  w1_play: 1.0
+  w2_fav: 1.0
+  w3_reply: 0.5
+  title_bonus_name: 10
+  title_bonus_keyword: 3    # "官方/原唱/MV/音频/歌词/完整版" 每项
+  duration_bonus: 5         # 1~8 分钟
+  duration_short_penalty: -10   # <30s
+  duration_long_penalty: -10    # >10min
+  author_penalty: -15       # 营销号特征
+  stage2_diff_threshold: 0.10   # 候选差值 <10% 才进阶段二精排
+  top_n_stage2: 3
+
+# ---- 收藏夹拆分（文档 §5.3）----
+fav:
+  per_folder_limit: 900     # 留余量，防并发写入超限
+  name_template: "{playlist_name} ({index})"
+
+# ---- 缓存 TTL ----
+cache:
+  wbi_keys_ttl_s: 86400     # img_key/sub_key 缓存 1 天
+  search_cache_ttl_s: 604800  # 搜索缓存 7 天（权重调参复用）

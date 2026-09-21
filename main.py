@@ -1,0 +1,1 @@
+# CLI 入口（auth / run / report），编排各阶段
