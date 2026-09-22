@@ -26,7 +26,6 @@ SEARCH_URL = "https://api.bilibili.com/x/web-interface/wbi/search/type"
 SPI_URL = "https://api.bilibili.com/x/frontend/finger/spi"
 PLAYLIST_URL = "https://music.163.com/api/v6/playlist/detail"
 SONG_DETAIL_URL = "https://music.163.com/api/v3/song/detail"
-WIKI_URL = "https://music.163.com/api/song/wiki/summary"
 FAV_FOLDER_URL = "https://api.bilibili.com/x/v3/fav/folder/add"
 FAV_RESOURCE_URL = "https://api.bilibili.com/x/v3/fav/resource/deal"
 
@@ -152,9 +151,6 @@ async def test_dry_run_5_songs_four_methods(respx_mock, tmp_path) -> None:
         return _ok(result=[])  # 歌5 全失败
 
     respx_mock.get(SEARCH_URL).mock(side_effect=search_handler)
-    respx_mock.get(WIKI_URL).mock(
-        return_value=httpx.Response(200, json={"code": 200, "data": {"summary": ""}})
-    )
 
     db, config, ncm, bili, http = _make_components(tmp_path)
     out = tmp_path / "output"
@@ -242,9 +238,6 @@ async def test_retry_exhausted_song_degrades_task_continues(respx_mock, tmp_path
         return _ok(result=[_video(f"BV{abs(hash(kw)) % 100}", _kw_title(kw))])
 
     respx_mock.get(SEARCH_URL).mock(side_effect=search_handler)
-    respx_mock.get(WIKI_URL).mock(
-        return_value=httpx.Response(200, json={"code": 200, "data": {"summary": ""}})
-    )
 
     db, config, ncm, bili, http = _make_components(tmp_path)
     # 注入零退避，避免测试真实 sleep（仅验证语义）
@@ -306,9 +299,6 @@ def test_keyboard_interrupt_resume_skips_done_songs(respx_mock, tmp_path) -> Non
         return _ok(result=[_video(f"BV{abs(hash(kw)) % 100}", _kw_title(kw))])
 
     respx_mock.get(SEARCH_URL).mock(side_effect=search_handler)
-    respx_mock.get(WIKI_URL).mock(
-        return_value=httpx.Response(200, json={"code": 200, "data": {"summary": ""}})
-    )
 
     out = tmp_path / "output"
 
@@ -427,9 +417,6 @@ async def test_refresh_discards_matches_keeps_search_cache(respx_mock, tmp_path)
         return _ok(result=[_video("BV1re", "歌1 艺1 官方MV")])
 
     respx_mock.get(SEARCH_URL).mock(side_effect=search_handler)
-    respx_mock.get(WIKI_URL).mock(
-        return_value=httpx.Response(200, json={"code": 200, "data": {"summary": ""}})
-    )
 
     out = tmp_path / "out"
     async with ncm, bili, http:
@@ -472,9 +459,6 @@ async def test_done_song_upgraded_by_new_manual_without_requests(respx_mock, tmp
     respx_mock.get(SEARCH_URL).mock(
         return_value=_ok(result=[_video("BV1xx", "歌1 官方MV")])
     )
-    respx_mock.get(WIKI_URL).mock(
-        return_value=httpx.Response(200, json={"code": 200, "data": {"summary": ""}})
-    )
 
     out = tmp_path / "out"
     async with ncm, bili, http:
@@ -514,9 +498,6 @@ async def test_done_song_same_manual_bv_not_rewritten(respx_mock, tmp_path) -> N
     )
     respx_mock.get(SEARCH_URL).mock(
         return_value=_ok(result=[_video("BV1xx", "歌1 官方MV")])
-    )
-    respx_mock.get(WIKI_URL).mock(
-        return_value=httpx.Response(200, json={"code": 200, "data": {"summary": ""}})
     )
 
     out = tmp_path / "out"
@@ -565,9 +546,6 @@ async def test_run_creates_task_and_updates_done(respx_mock, tmp_path) -> None:
     _mock_ncm_playlist(respx_mock)
     _mock_bili_env(respx_mock)
     respx_mock.get(SEARCH_URL).mock(side_effect=_ok_video_handler)
-    respx_mock.get(WIKI_URL).mock(
-        return_value=httpx.Response(200, json={"code": 200, "data": {"summary": ""}})
-    )
 
     db, config, ncm, bili, http = _make_components(tmp_path)
     out = tmp_path / "output"
@@ -591,9 +569,6 @@ async def test_two_runs_same_playlist_isolated_tasks(respx_mock, tmp_path) -> No
     _mock_ncm_playlist(respx_mock)
     _mock_bili_env(respx_mock)
     respx_mock.get(SEARCH_URL).mock(side_effect=_ok_video_handler)
-    respx_mock.get(WIKI_URL).mock(
-        return_value=httpx.Response(200, json={"code": 200, "data": {"summary": ""}})
-    )
 
     db, config, ncm, bili, http = _make_components(tmp_path)
     out = tmp_path / "output"
@@ -616,9 +591,6 @@ async def test_delete_task_clears_songs_keeps_cache(respx_mock, tmp_path) -> Non
     _mock_ncm_playlist(respx_mock)
     _mock_bili_env(respx_mock)
     respx_mock.get(SEARCH_URL).mock(side_effect=_ok_video_handler)
-    respx_mock.get(WIKI_URL).mock(
-        return_value=httpx.Response(200, json={"code": 200, "data": {"summary": ""}})
-    )
 
     db, config, ncm, bili, http = _make_components(tmp_path)
     out = tmp_path / "output"
@@ -707,9 +679,6 @@ async def test_formal_run_creates_folder_and_favs_all(respx_mock, tmp_path) -> N
         return _ok(result=[_video(f"BV{abs(hash(kw)) % 1000}", _kw_title(kw))])
 
     respx_mock.get(SEARCH_URL).mock(side_effect=search_handler)
-    respx_mock.get(WIKI_URL).mock(
-        return_value=httpx.Response(200, json={"code": 200, "data": {"summary": ""}})
-    )
 
     fav_calls = {"n": 0}
 
@@ -754,9 +723,6 @@ async def test_formal_rerun_reuses_media_id(respx_mock, tmp_path) -> None:
         return _ok(result=[_video(f"BV{abs(hash(kw)) % 1000}", _kw_title(kw))])
 
     respx_mock.get(SEARCH_URL).mock(side_effect=search_handler)
-    respx_mock.get(WIKI_URL).mock(
-        return_value=httpx.Response(200, json={"code": 200, "data": {"summary": ""}})
-    )
     respx_mock.post(FAV_RESOURCE_URL).mock(return_value=httpx.Response(200, json={"code": 0}))
 
     db, config, ncm, bili, http = _make_components(tmp_path)
@@ -786,9 +752,6 @@ async def test_formal_minus101_aborts(respx_mock, tmp_path) -> None:
         return _ok(result=[_video(f"BV{abs(hash(kw)) % 1000}", _kw_title(kw))])
 
     respx_mock.get(SEARCH_URL).mock(side_effect=search_handler)
-    respx_mock.get(WIKI_URL).mock(
-        return_value=httpx.Response(200, json={"code": 200, "data": {"summary": ""}})
-    )
 
     fav_calls = {"n": 0}
 

@@ -1,6 +1,6 @@
 """ncm.py 单测（里程碑 M1）：全部使用 respx mock，禁止真实网络请求。
 
-对应文档 §5.1：playlist/detail 分页 / song/detail 批量 / song/wiki/summary。
+对应文档 §5.1：playlist/detail 分页 / song/detail 批量。
 """
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from ncm import NcmClient, NcmError
 
 PLAYLIST_URL = "https://music.163.com/api/v6/playlist/detail"
 SONG_DETAIL_URL = "https://music.163.com/api/v3/song/detail"
-WIKI_URL = "https://music.163.com/api/song/wiki/summary"
 
 
 def _make_playlist_page(track_ids: list[int], n_tracks: int = 0) -> dict:
@@ -139,8 +138,6 @@ async def test_retry_twice_then_raise() -> None:
     async with client:
         with pytest.raises(NcmError):
             await client.fetch_playlist_track_ids(123)
-
-    # 初始 1 次 + 重试 2 次 = 3 次尝试
     assert len(respx.calls) == 3
 
 
@@ -155,18 +152,3 @@ async def test_http_500_retry_then_raise() -> None:
         with pytest.raises(NcmError):
             await client.fetch_playlist_track_ids(123)
     assert len(respx.calls) == 3
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_wiki_method_available() -> None:
-    """fetch_song_wiki 方法可用并返回 data（本步无调用方，仅保证可用）。"""
-    respx.get(WIKI_URL, params={"id": "777"}).mock(
-        return_value=httpx.Response(
-            200, json={"code": 200, "data": {"summary": "这是一首歌的百科"}}
-        )
-    )
-    client = NcmClient(httpx.AsyncClient())
-    async with client:
-        result = await client.fetch_song_wiki(777)
-    assert result == {"summary": "这是一首歌的百科"}

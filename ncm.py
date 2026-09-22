@@ -3,7 +3,7 @@
 NcmClient 提供：
 - fetch_playlist_track_ids：playlist/detail 按 n=1000&offset= 分页，只依赖 trackIds；
 - fetch_song_details：song/detail POST 批量取详情（每批 ≤1000）；
-- fetch_song_wiki：song/wiki/summary（救场专用，本里程碑不实现调用方）。
+- fetch_playlist_name：歌单名（收藏夹命名用）。
 
 设计约束：
 - httpx.AsyncClient 由外部注入（构造参数），便于测试 respx mock；
@@ -22,7 +22,6 @@ import httpx
 _BASE = "https://music.163.com"
 _PLAYLIST_DETAIL = f"{_BASE}/api/v6/playlist/detail"
 _SONG_DETAIL = f"{_BASE}/api/v3/song/detail"
-_SONG_WIKI = f"{_BASE}/api/song/wiki/summary"
 
 # 文档 §5.1：分页上限与每批上限
 _DEFAULT_MAX_TRACKS = 3000
@@ -79,7 +78,7 @@ class NcmClient:
                 last_error = exc
         raise NcmError(f"请求失败（重试 {self._retries} 次后仍失败）: {url}") from last_error
 
-    # ---- 歌单/详情/百科（文档 §5.1）-----------------------------
+    # ---- 歌单/详情（文档 §5.1）-------------------------------
 
     async def fetch_playlist_track_ids(
         self,
@@ -136,13 +135,6 @@ class NcmClient:
             data = await self._request_json("POST", _SONG_DETAIL, data=payload)
             results.extend(self._parse_songs(data.get("songs") or []))
         return results
-
-    async def fetch_song_wiki(self, song_id: int) -> dict:
-        """获取单曲百科摘要（文档 §5.1 救场专用；仅提供方法，本步无调用方）。"""
-        data = await self._request_json(
-            "GET", _SONG_WIKI, params={"id": song_id}
-        )
-        return data.get("data") or {}
 
     # ---- 字段解析 -------------------------------------------------
 

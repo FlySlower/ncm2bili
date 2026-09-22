@@ -96,6 +96,12 @@
 | 搜索重试耗尽单歌降级：BiliError 由 matcher 捕获置 MANUAL（fail_reason=SEARCH_FAILED），任务不中断；重试必须重新生成 wts/w_rid；BiliError 消息携带根因 | 修复 | §9.1/§5.2；实测 16:12 单点失败崩整个任务 |
 | MatchGate 增补第三闸门 NO_TITLE_MATCH（标题须含歌名 token）与短歌名联合闸（歌名 ≤2 字时标题还须含艺人 token），阈值默认 min_score=16 / min_margin=2 | 功能 | §4.2；实测三批次（62/25/130 首）驱动 |
 
+### v0.4.1 → v0.4.2 变更（起草）
+
+| 变更 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| 移除废弃的音乐百科 wiki 方法（ncm.py）及测试中 WIKI_URL mock 残留 | 清理 | §5.1/§3.1；降级链早已不再调用，残留曾导致测试维护事故 |
+
 ---
 
 ## 1. 项目概述
@@ -177,7 +183,7 @@
 ncm2bili/
 ├── main.py                  # CLI 入口（auth / run / task / report），编排各阶段
 ├── config.py                # 限速/并发/权重等可调参数（可由 config.yaml 覆盖）
-├── ncm.py                   # 网易云模块（歌单/详情；wiki 方法保留备用，无调用方）
+├── ncm.py                   # 网易云模块（歌单/详情）
 ├── bili_search.py           # B站搜索 + WBI 签名 + buvid3 预取
 ├── scorer.py                # 两阶段评分
 ├── matcher.py               # 状态机闯关逻辑（阶段二），所有查询/落盘带 task_id 作用域
@@ -319,7 +325,6 @@ score = w1·log10(播放量+1)
 | :--- | :--- | :--- |
 | 歌单曲目 | `GET music.163.com/api/v6/playlist/detail?id=&n=1000&offset=` | `trackIds` 完整；分页至 3000 |
 | 歌曲详情 | `POST music.163.com/api/v3/song/detail`，body `c=[{id:..},...]` | 每批 ≤1000 |
-| 音乐百科 | `GET music.163.com/api/song/wiki/summary?id=` | 方法保留备用，当前降级链（§4.3）不再调用 |
 
 从 `song/detail` 免费获得：`name`、`ar`（歌手）、`al`（专辑）、**`alia`（别名）**、**`originSongSimpleData`（翻唱的原曲信息）**。
 
