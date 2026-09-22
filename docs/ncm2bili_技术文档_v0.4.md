@@ -91,7 +91,7 @@
 | 新增匹配置信度门槛 MatchGate：`match.min_score`/`match.min_margin` 双闸门（config 驱动），不达标置 MANUAL 并记 `LOW_CONFIDENCE` | 功能 | §4.1/§4.2；实测一 62 首错配率约 37% 驱动 |
 | 新增关键词卫生 sanitize 管线：括号注释剥离、追加词仅出自降级链、remix 信息优先保留 | 修复 | §4.3；同上 |
 | 新增 8 个实测一真实错配病例为 matcher 回归 fixture（Graveyard Phonk / Lake Arrowhead / in heat. / Vai Toma / Let Me Think About It / Constriction2.0 / 九万进行曲 / Sweet Sensation） | 测试 | §13.1 |
-| 修复 search_cache 污染：根因为 B 站边缘缓存对相似查询返回陈旧响应（高亮词非查询词为特征），客户端读时归属校验（标题须含 sanitize 后歌名 token），脏行作废重取、不合格不落库、空结果不写缓存 | 修复 | §4.4；P0 |
+| 修复 search_cache 污染：根因为 B 站边缘缓存对相似查询返回陈旧响应（高亮词非查询词为特征），客户端读时归属校验（标题须含 sanitize 后歌名 token），脏行作废重取、不合格不落库、空结果不写缓存 | 修复 | §4.4；P0，数据正确性 |
 | 熔断器兼容 WAF 412：HTTP 412 且 body 非 JSON 时按 -412 计入滑动窗口（此前仅认 body code，WAF 412 永不计数导致全局暂停失效，实测 16:12 连发 6 次未触发） | 修复 | §7 响应层 b |
 | 搜索重试耗尽单歌降级：BiliError 由 matcher 捕获置 MANUAL（fail_reason=SEARCH_FAILED），任务不中断；重试必须重新生成 wts/w_rid；BiliError 消息携带根因 | 修复 | §9.1/§5.2；实测 16:12 单点失败崩整个任务 |
 | MatchGate 增补第三闸门 NO_TITLE_MATCH（标题须含歌名 token）与短歌名联合闸（歌名 ≤2 字时标题还须含艺人 token），阈值默认 min_score=16 / min_margin=2 | 功能 | §4.2；实测三批次（62/25/130 首）驱动 |
@@ -308,7 +308,7 @@ score = w1·log10(播放量+1)
 - **--refresh 行为**：仅清除当前任务的匹配结果（`songs` 中 `status` 回退为 PENDING），保留 `search_cache` 和歌单抓取数据，resume 时可直接利用缓存重新匹配。
 - **增量语义**：歌单新增歌曲时，旧歌曲因 `songs.status='DONE'` 被断点续跑直接跳过（不发任何请求），只有新歌走完整状态机。`search_cache` 的作用是跨任务复用搜索结果、避免重复搜索请求，**不直接决定歌曲状态**（按 `task_id` 隔离判定状态）。
 -**缓存正确性约束**：cache key 为完整 sanitize 后关键词（禁止截断/过度归一化导致碰撞）；命中缓存的结果对象按 key 隔离，禁止跨 key 复用同一可变对象；搜索返回空结果不得回退复用其他关键词的结果。
-实测记录（2026-09-22）：B 站边缘缓存可能对不同相似查询返回逐字节相同的陈旧内容，归属校验是客户端唯一防线，不得移除。
+**实测记录（2026-09-22）：B 站边缘缓存可能对不同相似查询返回逐字节相同的陈旧内容，归属校验是客户端唯一防线，不得移除。**
 ---
 
 ## 5. 外部接口清单
