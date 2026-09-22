@@ -8,9 +8,9 @@ rate_limit:
     interval_ms: 400        # 基础间隔
     jitter_ms: [100, 300]   # 随机抖动范围
   fav:
-    concurrency: 2          # 收藏并发（写操作更保守）
-    interval_ms: 500
-    jitter_ms: [100, 200]
+    concurrency: 1          # 收藏并发（新账号保守；老账号可调回 2）
+    interval_ms: 1000       # 基础间隔（-702 限流经验：偏保守）
+    jitter_ms: [200, 400]
   stage2:                   # 阶段二补查（详情/粉丝数）
     concurrency: 4
     interval_ms: 400
@@ -53,6 +53,11 @@ scoring:
   stage2_diff_threshold: 0.10   # 候选差值 <10% 才进阶段二精排
   top_n_stage2: 3
 
+# ---- 匹配置信度准入（文档 §4.2 MatchGate，实测一错配率驱动）----
+match:
+  min_score: 16            # top1 低于该分 → 低置信置 MANUAL
+  min_margin: 2            # top1-top2 分差小于该值 → 头部不分伯仲置 MANUAL
+
 # ---- 收藏夹拆分（文档 §5.3）----
 fav:
   per_folder_limit: 900     # 留余量，防并发写入超限
@@ -62,3 +67,32 @@ fav:
 cache:
   wbi_keys_ttl_s: 86400     # img_key/sub_key 缓存 1 天
   search_cache_ttl_s: 604800  # 搜索缓存 7 天（权重调参复用）
+
+# ---- 降级链关键词（文档 §4.3：逐轮降级，支持 {name}/{artist} 占位符）----
+degrade:
+  # 括号注释剥离时保留的版本信息 token（内容含任一 token 的括号整段保留）
+  keep_tokens:
+    - "live"
+    - "remix"
+    - "bootleg"
+    - "slowed"
+    - "speed up"
+    - "sped up"
+    - "reverb"
+    - "feat"
+    - "ft"
+    - "official"
+    - "mv"
+    - "radio edit"
+    - "mix"
+    - "edit"
+  keywords:
+    - "{name} {artist}"
+    - "{artist} {name}"
+    - "{name}"
+    - "{name} MV"
+    - "{name} 纯享"
+    - "{name} 4K"
+    - "{name} 修复"
+    - "{name} 完整版"
+    - "{name} 歌词"

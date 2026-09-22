@@ -2,8 +2,8 @@
 
 | 项目 | 内容 |
 | :--- | :--- |
-| **版本** | v0.3（v0.1 + v0.2 合并修订版） |
-| **日期** | 2026-09-21 |
+| **版本** | v0.4（v0.1 + v0.2 合并修订版） |
+| **日期** | 2026-09-22 |
 | **技术栈** | Python 3.11+ / httpx / asyncio / SQLite / Pydantic / playwright(仅 auth) |
 | **目标规模** | 单歌单最大 3000 首，全程 ≤ 20 分钟 |
 
@@ -40,6 +40,62 @@
 | 收藏夹拆分与命名策略（§5.3） | 补充 | — |
 | 测试：移除 requests-mock（项目用 httpx），统一 respx | 修正 | — |
 
+### v0.3 → v0.3.1 变更
+
+| 变更 | 说明 |
+| :--- | :--- |
+| v0.3 §5.2 的"buvid3 获取"一段替换为降级链设计 | — |
+
+### v0.3.1 → v0.3.2 变更
+
+| 变更 | 说明 |
+| :--- | :--- |
+| v0.3.1 §3 的数量与 §5.3 对齐 | — |
+| 删除音乐 Wiki 相关信息 | — |
+
+### v0.3.2 → v0.3.3 变更（2026-09-22，代码实测对齐）
+
+| 变更 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| 收藏接口 `/x/v3/fav/resource/add` 废弃（404）→ 改用 `/x/v3/fav/resource/deal`，`rid` 为 av 号 | 修正 | 实测 2026-09-22；§2/§5.2/§9.3 |
+| 新增 `-702`（"请求频率过高"）限流分类：与 `-412` 同级走熔断，退避基数 2 倍（4s→8s→16s） | 补充 | §7 响应层 b |
+| 收藏默认保守参数：并发 1 / 1000ms + 200~400ms jitter（新账号防 -702） | 修正 | §7/§8 估算 |
+| 降级链由 `config.yaml degrade.keywords` 驱动（`{name}`/`{artist}` 占位符），按文档 §4.3 | 修正 | §4.3/§3 状态机图 |
+| 新增全局熔断器 `circuit_breaker.py` 与公共退避模块 `backoff.py` | 补充 | §7/§3.1 |
+| 搜索缓存接通：`search_cache` 表按关键词命中，TTL 7 天（§4.4） | 补充 | §4.4 |
+| 优先级统一入口 `whitelist_bv` 表（manual/whitelist 同步入库），内存 dict 移除 | 补充 | §4.1/§6 DDL |
+| DONE 歌 manual 重查：启动时用更高优先级结果升级 | 补充 | §4.1 |
+| --refresh 只清匹配、保留 search_cache | 补充 | §4.4/§11.4 |
+| **任务制重构**：`run` 默认新建任务；新增 `task` 子命令（list/resume/delete）；`songs` 表加 `task_id`，新增 `tasks` 表；`matcher.py` 全链路带 task 作用域 | **架构级** | §1.1/§3/§4.4/§6/§11.4/§13 |
+
+### v0.3.3 → v0.4 变更（2026-09-22，一致性收口）
+
+| 变更 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| 降级链默认关键词 5 轮扩充至 9 轮（新增 4K/修复/完整版/歌词，移除舞台轮） | 改进 | §4.3，config 驱动；§8 估算系数 1.2→1.3 |
+| 报告绑定 task_id：`load_report_rows`/`write_reports` 增加 task_id 参数，dry-run 报告只含当前任务 | 修复 | §3/§10.1；默认 None 保持全量（report --task-id 依赖） |
+| 新增 `FAV_FAILED` 状态：收藏失败（非 -404/62002）置 FAV_FAILED，resume 只重跑阶段三（不重搜索），review.html 同 MANUAL 展示 | 功能 | §6/§4.4/§9.3/§10.2 |
+| 收藏阶段接入全局熔断器：`-412`/`-702` 计入滑动窗口，达阈值全局暂停+降并发 | 修复 | §7 响应层 b（此前仅搜索阶段生效） |
+| UA 随机选择落地：启动时从 `http.user_agents` 选一个并全程固定，传入搜索/收藏客户端 | 修复 | §7 身份层（此前为死配置，实际单一硬编码 UA） |
+| 日志接入 CLI：入口调用 `setup_logging()`，新增 `--debug`，cookie 脱敏 Filter 生产路径生效 | 修复 | §12 |
+| resume 路径注入 CircuitBreaker；修复 resume 摘要查询缺列导致的 IndexError | 修复 | §7/§11.4 |
+| matcher/fav/bili_search 三处模块 docstring 对齐实现（WIKI 残留、旧降级链、旧收藏参数、旧 buvid3 主路径） | 修正 | §4.1/§4.3/§5.2/§7 |
+| tasks 表 DDL 对齐代码（`finished_at`/`stats` 取代 `total_songs`/`completed_songs`，移除无写入路径的 CANCELLED） | 修正 | §6/§3/§11.4 |
+| delete 语义统一：仅删 songs/tasks，保留 search_cache（§4.4/§13.2 原表述矛盾） | 修正 | §4.4/§13.2 |
+| §11.4 补充 `report --task-id/--serve` 与 `task delete --all-finished`、`--yes` 参数文档 | 补充 | §11.4 |
+
+### v0.4 → v0.4.1 变更
+
+| 变更 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| 新增匹配置信度门槛 MatchGate：`match.min_score`/`match.min_margin` 双闸门（config 驱动），不达标置 MANUAL 并记 `LOW_CONFIDENCE` | 功能 | §4.1/§4.2；实测一 62 首错配率约 37% 驱动 |
+| 新增关键词卫生 sanitize 管线：括号注释剥离、追加词仅出自降级链、remix 信息优先保留 | 修复 | §4.3；同上 |
+| 新增 8 个实测一真实错配病例为 matcher 回归 fixture（Graveyard Phonk / Lake Arrowhead / in heat. / Vai Toma / Let Me Think About It / Constriction2.0 / 九万进行曲 / Sweet Sensation） | 测试 | §13.1 |
+| 修复 search_cache 污染：根因为 B 站边缘缓存对相似查询返回陈旧响应（高亮词非查询词为特征），客户端读时归属校验（标题须含 sanitize 后歌名 token），脏行作废重取、不合格不落库、空结果不写缓存 | 修复 | §4.4；P0 |
+| 熔断器兼容 WAF 412：HTTP 412 且 body 非 JSON 时按 -412 计入滑动窗口（此前仅认 body code，WAF 412 永不计数导致全局暂停失效，实测 16:12 连发 6 次未触发） | 修复 | §7 响应层 b |
+| 搜索重试耗尽单歌降级：BiliError 由 matcher 捕获置 MANUAL（fail_reason=SEARCH_FAILED），任务不中断；重试必须重新生成 wts/w_rid；BiliError 消息携带根因 | 修复 | §9.1/§5.2；实测 16:12 单点失败崩整个任务 |
+| MatchGate 增补第三闸门 NO_TITLE_MATCH（标题须含歌名 token）与短歌名联合闸（歌名 ≤2 字时标题还须含艺人 token），阈值默认 min_score=16 / min_margin=2 | 功能 | §4.2；实测三批次（62/25/130 首）驱动 |
+
 ---
 
 ## 1. 项目概述
@@ -49,8 +105,8 @@
 ### 1.1 设计目标
 
 - **正确性优先**：通过多层筛选机制（白名单 / 黑名单 / 两阶段评分 / 降级 / 人工回灌）保证匹配质量。
-- **速度可接受**：3000 首全流程 ≤ 20 分钟（瓶颈在 B 站接口响应速度，而非本机算力）。
-- **可断点续跑**：任何时刻中断，重启后从断点继续，已完成的工作不重复。
+- **速度可接受**：目标 3000 首全流程 ≤ 20 分钟。注意：该项以搜索为主视角估算（见 §8），收藏阶段按新账号保守默认（并发 1 / 1000ms）约需 60 分钟，老账号调回宽松参数后整体可回落至 20~30 分钟；瓶颈在 B 站接口响应速度与风控节奏，而非本机算力。
+- **任务制：每次运行独立任务，支持手动恢复/清理历史任务**：每次运行自动生成唯一 task_id，任务间数据隔离；支持手动 resume 恢复中断任务、delete 清理历史任务。
 - **可人工介入**：自动解决不了的歌进入人工队列，人工结果可回灌并被最高优先级采用。
 
 ### 1.2 非目标
@@ -67,10 +123,9 @@
 | :--- | :--- |
 | B 站单个收藏夹上限 **1000 个视频**，收藏夹总数上限约 **99 个** | 3000 首必须自动拆分为多个收藏夹；按歌手/主题建夹等功能受 99 上限约束 |
 | B 站搜索接口已强制 **WBI 签名**（2025-05 起），且要求 `buvid3` cookie（2025-06 起） | 搜索模块必须实现 WBI 签名与 buvid3 预取 |
-| 收藏接口 `/x/v3/fav/resource/add` 需要登录态（`SESSDATA` + `bili_jct`） | 用户必须授权；程序通过 `auth` 命令自动捕获并安全存储凭证 |
-| B 站有风控（HTTP 412 / body code `-412`），高频、规律化请求会触发 | 间隔 jitter + 并发上限 + 分层退避，不可绕过只能尊重 |
+| 收藏接口 `/x/v3/fav/resource/deal` 需要登录态（`SESSDATA` + `bili_jct`），且 `rid` 须为 av 号 | 用户必须授权；程序通过 `auth` 命令自动捕获并安全存储凭证 |
+| B 站有风控（HTTP 412 / body code `-412` / `-702`），高频、规律化请求会触发 | 间隔 jitter + 并发上限 + 分层退避，不可绕过只能尊重 |
 | 网易云 `playlist/detail` 返回的 `tracks` 不完整，完整曲目在 `trackIds` | 需二次调用 `song/detail` 批量取详情 |
-| 网易云 `song/wiki/summary` **每首歌单独一次请求，无批量接口** | 作为第 4 轮降级"救场"步骤仅对失败歌曲触发，控制调用量 |
 
 ---
 
@@ -95,15 +150,15 @@
 └─────────────────────────────────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
-│ 阶段二：逐首匹配（核心，asyncio 并发 4）                        │
-│   每首歌的状态机闯关：                                         │
+│ 阶段二：逐首匹配（核心，asyncio 并发 4）【task 作用域】           │
+│   每首歌的状态机闯关（所有状态/结果绑定 task_id）：              │
 │   WHITELIST_BV ─► SEARCH ─► BLACKLIST ─► UPLOADER_WL        │
-│   ─► SCORING(两阶段) ─► RETRY(降级关键词) ─► WIKI ─► MANUAL   │
+│   ─► SCORING(两阶段) ─► RETRY(降级关键词) ─► MANUAL          │
 └─────────────────────────────────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
-│ 阶段三：批量收藏（B站，并发 2~3）                               │
-│   自动建收藏夹（每 1000 首一个）──► 逐条 add ──► 报告           │
+│ 阶段三：批量收藏（B站，并发 1 保守默认，可调）【task 作用域】         │
+│   自动建收藏夹（每 900 首一个，见§5.3留余量策略）──► 逐条 deal ──► 报告（绑定 task_id） │
 │   （--dry-run 时跳过本阶段，改为 preview_report.html）         │
 └─────────────────────────────────────────────────────────────┘
                             │
@@ -113,20 +168,23 @@
 │   ──► 重跑（manual 优先级最高）──► DONE                        │
 └─────────────────────────────────────────────────────────────┘
 
-横切：SQLite（缓存+状态机）│ 分层风控（§7）│ 结构化日志（§12）│ 测试（§13）
+横切：SQLite（缓存+状态机）│ 任务管理（§4.4）│ 分层风控（§7）│ 结构化日志（§12）│ 测试（§13）
 ```
 
 ### 3.1 目录结构
 
 ```
 ncm2bili/
-├── main.py                  # CLI 入口（auth / run / report），编排各阶段
+├── main.py                  # CLI 入口（auth / run / task / report），编排各阶段
 ├── config.py                # 限速/并发/权重等可调参数（可由 config.yaml 覆盖）
-├── ncm.py                   # 网易云模块（歌单/详情/百科）
+├── ncm.py                   # 网易云模块（歌单/详情；wiki 方法保留备用，无调用方）
 ├── bili_search.py           # B站搜索 + WBI 签名 + buvid3 预取
 ├── scorer.py                # 两阶段评分
-├── matcher.py               # 状态机闯关逻辑（阶段二）
+├── matcher.py               # 状态机闯关逻辑（阶段二），所有查询/落盘带 task_id 作用域
 ├── fav.py                   # 收藏夹创建与批量收藏（阶段三）
+├── circuit_breaker.py       # 全局熔断器（滑动窗口 -412/-702 计数 → 暂停+降并发，§7）
+├── backoff.py               # 单请求指数退避公共实现（§7 响应层 a，搜索/收藏共用）
+├── logging_setup.py         # 日志初始化与 cookie 脱敏 Filter（§12）
 ├── report.py                # CSV 报告 / review.html / preview_report.html（阶段四）
 ├── review_server.py         # review.html 的本地保存服务（localhost only，§10.3）
 ├── auth.py                  # playwright 授权与凭证加密存储（阶段零）
@@ -139,6 +197,8 @@ ncm2bili/
 ├── credentials.db           # 加密存储的 B 站 cookie（权限 600）
 └── cache.db                 # SQLite 缓存与状态
 ```
+
+注：`credentials.db` 与 `cache.db` 复用同一 Schema 建全部表，各库仅使用与自身职责相关的表；冗余表不影响功能。
 
 ---
 
@@ -153,7 +213,7 @@ ncm2bili/
    ①whitelist.json 精确命中?         是 ──► DONE (method=WHITELIST_BV)
                │ 否
                ▼
-   ②B站搜索 "歌名 歌手"
+   ②B站搜索 轮 1 关键词（§4.3："歌名 歌手"）
                │
                ▼
    ③黑名单过滤（标题归一化后含黑名单词 → 淘汰并记因）
@@ -162,13 +222,10 @@ ncm2bili/
    ④uploaders.json 命中 mid 且标题含歌名?   是 ──► DONE (method=UPLOADER_WL)
                │ 否
                ▼
-   ⑤两阶段评分 ──► 有合格候选?      是 ──► DONE (method=SCORED)
+    ⑤两阶段评分 ──► 有合格候选（通过 §4.2 置信度准入）?   是 ──► DONE (method=SCORED)
                │ 否
                ▼
-   ⑥降级关键词重试（歌名 / 歌名+现场），≤2 轮 ──► 成功则回 ③
-               │ 仍失败
-               ▼
-   ⑦/wiki 救场：用 alia、originSongSimpleData、wiki 摘要拼新关键词 ──► 回 ③
+   ⑥降级关键词重试：按 §4.3 降级链逐轮重试，成功回 ③
                │ 仍失败
                ▼
            MANUAL（method=MANUAL 待人工）──► review.html 回灌 ──► DONE
@@ -206,24 +263,52 @@ score = w1·log10(播放量+1)
 
 阶段二仅用于差值接近时精排；差值明显时直接用阶段一结果，省下请求。
 
+**置信度准入（MatchGate）**：
+
+打分排序后、写库前，对 top1 候选做双闸门校验，任一不满足即不采纳：
+
+- `top1.score < match.min_score`（低置信）→ MANUAL
+- `top1.score - top2.score < match.min_margin`（头部不分伯仲）→ MANUAL
+
+不采纳时：bvid 置空，`fail_reason` 记 `LOW_CONFIDENCE: top1={s1} top2={s2}`；`score_detail`（含 top3 候选）完整落库，供 review.html 展示与人工裁决。
+
+参数 config 驱动（`config.yaml` 的 `match` 段，默认值以 config.yaml 为准，代码与 docstring 禁止硬编码）。WHITELIST_BV / UPLOADER_WL 路径不经打分，不适用本门槛。MANUAL 语义不变，review/resume 现有路径直接复用。
+
+设计动机（实测一，2026-09-22）：62 首真实歌单错配率约 37%，错配全部源于低分或近分候选被直接采纳——top1 仅 9.9 分照收（in heat.）；正确候选在 #2 且分差 <2 分（Graveyard Phonk，17.87 vs 15.87）。
+第三闸门（相关性前置）：top1 候选标题归一化（去 HTML 标签/实体、小写、去标点）后须包含歌名主体 token，否则 MANUAL（fail_reason=NO_TITLE_MATCH），先于分数/margin 判定。歌名 ≤2 个 CJK 字符时追加联合条件：标题还须包含艺人 token 之一，否则同判 MANUAL——防"我们/海胆/黑洞/四季"类泛词短歌名命中同词非歌内容。token 匹配规则（全包含/逐 token/边界）以代码实现为准并有单测覆盖。
+
 ### 4.3 关键词降级链
 
-| 轮次 | 关键词 | 说明 |
+降级链由 `config.yaml` 的 `degrade.keywords` 驱动（支持 `{name}`/`{artist}` 占位符），默认 9 轮，按"精准 → 泛化 → 特化"递进：
+
+| 类别 | 代表关键词 | 目的 |
 | :--- | :--- | :--- |
-| 1 | `歌名 歌手` | 默认 |
-| 2 | `歌名` | 歌手可能有误或生僻 |
-| 3 | `歌名 现场` / `歌名 音频` | 视情况二选一 |
-| 4（救场） | `别名 歌手` / `歌名 原唱歌手` / `中文译名 歌手` | 来自 alia / originSongSimpleData / wiki；注意 wiki 接口无批量，每首歌一次请求，仅走到此轮才调用 |
+| 精准 | `歌名 歌手`、`歌手 歌名` | 默认与兼容两种语序 |
+| 泛化 | `歌名` | 歌手名生僻或有误时兜底 |
+| 特化 | `歌名 MV`、`歌名 纯享`、`歌名 4K`、`歌名 修复`、`歌名 完整版`、`歌名 歌词` | 定向命中官方 MV / 综艺纯净版 / 高清修复 / 完整版 / 字幕版 |
 
-### 4.4 断点续跑
+完整轮次、顺序与关键词以 `config.yaml` 为准，修改后无需改代码；按 §4.1 ⑥ 逐轮重试，任一轮产出合格候选即回到主流程，不再继续后续轮次。
 
-- 每首歌的**每个状态跃迁立即落盘** SQLite（§6 的 `songs` 表）。
-- 搜索缓存以 `歌名|歌手` 为 key：调整评分权重后重跑，只重打分、不重搜索。
-- 已 DONE 的歌永不再发请求——除非：
-  - 用户显式传 `--refresh`（丢弃匹配结果，保留歌单数据）；
-  - 或 `manual.json` 新增了优先级更高的结果（见 §4.1）。
-- **增量语义**：歌单新增歌曲时，旧歌曲命中缓存直接 DONE，只有新歌走完整状态机。
+**关键词卫生（sanitize）**：
 
+构造/降级任何搜索关键词前，统一经过 sanitize 函数处理（全管线无旁路）：
+
+1. **括号注释剥离**：全/半角括号内为 CJK 描述性文字（用户自定义标注，如 `（压迫感）`、`"炙热"`）整段删除；已知版本 token 保留（Radio Edit/Mix、Remix、Slowed、Speed Up、slowed+reverb、feat./ft.、Official 等），清单入 `config.yaml` 的 `degrade.keep_tokens`；
+2. **追加词仅出自降级链**：除 `degrade.keywords` 模板外，代码内禁止任何硬编码追加修饰词；
+3. **remix 信息优先保留**：歌名中的 remix/bootleg/版本信息在降级时优先于歌名本体保留，防止匹配回原曲或同名他曲（实测一病例：WINTER FEELS LIKE FUNK 降级后匹配回 JVKE 原曲；MiyaGi-I Got Love remix 匹配回原曲）。
+
+动机：全部来自实测一（2026-09-22）错配病例——`Constriction2.0（压迫感）` 命中"巨物的压迫感"；"…纯享"组合命中 LE SSERAFIM《CELEBRATION》。
+
+### 4.4 任务与缓存
+
+- **断点数据按任务隔离**：每首歌的状态跃迁落盘至 `songs` 表，新增 `task_id` 列（§6），每个运行周期生成唯一 `task_id`，所有状态、评分、缓存结果均绑定当前任务，互不干扰。
+- **resume 语义**：`python main.py task resume <task_id>` 加载指定任务的断点状态：已 DONE 的歌直接跳过（不重复发请求）；`FAV_FAILED` 的歌只重跑阶段三——直接取已匹配的 bvid 重新 deal，不重进阶段二、不重复搜索请求。
+- **delete 语义**：`python main.py task delete <task_id>` 物理删除指定任务的所有状态与中间结果（`songs` 中该 `task_id` 的行及 `tasks` 表对应行）。`search_cache` 不受 delete 影响（跨任务共享，见同节），如需清理须手动。
+- **search_cache 跨任务共享**：搜索缓存以**关键词（keyword）**为 key（`search_cache` 表，TTL 7 天），缓存 key 与 `task_id` 无关——不同任务对同一关键词的搜索结果可复用，调整评分权重后重跑只重打分、不重搜索。
+- **--refresh 行为**：仅清除当前任务的匹配结果（`songs` 中 `status` 回退为 PENDING），保留 `search_cache` 和歌单抓取数据，resume 时可直接利用缓存重新匹配。
+- **增量语义**：歌单新增歌曲时，旧歌曲因 `songs.status='DONE'` 被断点续跑直接跳过（不发任何请求），只有新歌走完整状态机。`search_cache` 的作用是跨任务复用搜索结果、避免重复搜索请求，**不直接决定歌曲状态**（按 `task_id` 隔离判定状态）。
+-**缓存正确性约束**：cache key 为完整 sanitize 后关键词（禁止截断/过度归一化导致碰撞）；命中缓存的结果对象按 key 隔离，禁止跨 key 复用同一可变对象；搜索返回空结果不得回退复用其他关键词的结果。
+实测记录（2026-09-22）：B 站边缘缓存可能对不同相似查询返回逐字节相同的陈旧内容，归属校验是客户端唯一防线，不得移除。
 ---
 
 ## 5. 外部接口清单
@@ -234,7 +319,7 @@ score = w1·log10(播放量+1)
 | :--- | :--- | :--- |
 | 歌单曲目 | `GET music.163.com/api/v6/playlist/detail?id=&n=1000&offset=` | `trackIds` 完整；分页至 3000 |
 | 歌曲详情 | `POST music.163.com/api/v3/song/detail`，body `c=[{id:..},...]` | 每批 ≤1000 |
-| 音乐百科 | `GET music.163.com/api/song/wiki/summary?id=` | 救场专用，失败歌曲才调；无批量接口 |
+| 音乐百科 | `GET music.163.com/api/song/wiki/summary?id=` | 方法保留备用，当前降级链（§4.3）不再调用 |
 
 从 `song/detail` 免费获得：`name`、`ar`（歌手）、`al`（专辑）、**`alia`（别名）**、**`originSongSimpleData`（翻唱的原曲信息）**。
 
@@ -247,7 +332,7 @@ score = w1·log10(播放量+1)
 | 视频详情 | `GET api.bilibili.com/x/web-interface/view?bvid=` | 可选 | 三连细分（阶段二） |
 | UP主信息 | `GET api.bilibili.com/x/relation/stat?vmid=` | 可选 | 粉丝数，按 mid 缓存 |
 | 创建收藏夹 | `POST api.bilibili.com/x/v3/fav/folder/add` | SESSDATA+bili_jct | body 含 csrf |
-| 收藏 | `POST api.bilibili.com/x/v3/fav/resource/add` | SESSDATA+bili_jct | body: `rid&type=2&media_id&csrf` |
+| 收藏 | `POST api.bilibili.com/x/v3/fav/resource/deal` | SESSDATA+bili_jct | body: `rid&type=2&add_media_ids&del_media_ids&csrf`；`rid` 为 av 号；实测 2026-09-22 `/add` 已废弃（404） |
 
 **错误码约定**：B 站错误同时体现在 HTTP 状态码与 body 的 `code` 字段。本文统一以 **API code**（body 中的值）为准；412 指 HTTP 状态码，`-412` 指 API code，两者同义均按风控处理。
 
@@ -260,7 +345,12 @@ score = w1·log10(播放量+1)
 
 `img_key/sub_key` 缓存于内存 + 落盘 `cache.db`，TTL 约 1 天；遇到 `-403`（签名/时间戳错误）时强制刷新重取一次。
 
-**buvid3 获取**：启动时先访问 `bilibili.com` 主页，从 Set-Cookie 抓取，存入凭证表随请求携带。
+**buvid3 获取**：
+
+1. 主路径：GET https://api.bilibili.com/x/frontend/finger/spi，取 data.b_3 写入 cookie buvid3，同时把 data.b_4 存为 buvid4 备用；
+2. 降级路径：spi 请求失败（网络错误/非 0 code）时，回退主页 Set-Cookie 抓取，且抓取前断言 session UA 已配置、不含 python/curl/httpx 子串，不满足则先修正 UA 再请求；
+3. 两条路径都失败 → 抛出带明确指引的异常（提示检查网络/UA 配置），禁止静默继续；
+4. buvid3 成功后持久化到 credentials.db，重跑时直接复用，不必每次重新获取。
 
 ### 5.3 收藏夹拆分策略
 
@@ -274,25 +364,36 @@ score = w1·log10(播放量+1)
 
 ```sql
 CREATE TABLE songs (
-  song_key    TEXT PRIMARY KEY,   -- "歌名|歌手"
+  song_key    TEXT,               -- "歌名|歌手"
+  task_id     TEXT,               -- 任务标识，与 song_key 联合主键
   ncm_id      INTEGER,
   name        TEXT,
   artist      TEXT,
   album       TEXT,
   alia        TEXT,               -- JSON 数组
   origin      TEXT,               -- 翻唱原曲信息 JSON
-  status      TEXT,               -- PENDING/DONE/MANUAL
+  status      TEXT,               -- PENDING/DONE/MANUAL/FAV_FAILED
   method      TEXT,               -- MANUAL/WHITELIST_BV/UPLOADER_WL/SCORED
   bvid        TEXT,
   score_detail TEXT,              -- 评分明细 JSON（抽查调权重用）
   fail_reason TEXT,
-  updated_at  INTEGER
+  updated_at  INTEGER,
+  PRIMARY KEY (song_key, task_id)
 );
 
 CREATE TABLE search_cache (
   keyword    TEXT PRIMARY KEY,
   results    TEXT,                -- 候选 JSON
   fetched_at INTEGER
+);
+
+CREATE TABLE tasks (
+  task_id     TEXT PRIMARY KEY,
+  created_at  INTEGER,
+  playlist_id TEXT,
+  status      TEXT,               -- RUNNING/DONE/FAILED
+  finished_at INTEGER,
+  stats       TEXT                -- 统计信息 JSON（total/done/manual 等）
 );
 
 CREATE TABLE uploader_cache (
@@ -326,10 +427,10 @@ CREATE TABLE kv_meta (
 
 | 层级 | 机制 | 参数（config.yaml 可调） | 职责 |
 | :--- | :--- | :--- | :--- |
-| **预防层** | 间隔抖动：每次请求 sleep = 基础间隔 + uniform(jitter) | 搜索：400ms + 100~300ms；收藏：500ms + 100~200ms | 避免请求时间间隔规律化 |
+| **预防层** | 间隔抖动：每次请求 sleep = 基础间隔 + uniform(jitter) | 搜索：400ms + 100~300ms；收藏：1000ms + 200~400ms（新账号保守默认，老账号可在 `config.yaml` 调回 500ms + 100~200ms） | 避免请求时间间隔规律化 |
 | **身份层** | 会话级固定 UA + 完整 header 集合 | UA 从 3 个真实浏览器 UA 中**启动时随机选一个并全程固定**；补齐 sec-ch-ua / Accept-Language / Referer | 模拟真实浏览器；**严禁**在同一 session 内切换 UA（与 SESSDATA 混用是风控特征） |
 | **响应层 a** | 单请求指数退避：412/网络错误时该请求重试，间隔 2s→4s→8s，最多 3 次 | 初始 2s，倍数 2，上限 3 次 | 处理瞬时抖动 |
-| **响应层 b** | 全局熔断：滑动窗口 60s 内 API code `-412` 达 3 次 → 全局暂停 60s；达 5 次 → 暂停 5min 并降并发 50%、输出 WARNING | 窗口 60s；阈值 3/5 | 持续风控时主动冷却 |
+| **响应层 b** | 全局熔断：滑动窗口 60s 内 API code `-412` 达 3 次 → 全局暂停 60s；达 5 次 → 暂停 5min 并降并发 50%、输出 WARNING；`-702`（"请求频率过高"）与 `-412` 同级入熔断，但退避基数 2 倍（4s→8s→16s）；阶段三内连续 2 次 `-702` → 剩余请求 interval 翻倍（上限 4 倍）并 WARNING | 窗口 60s；阈值 3/5；降速阈值 2 次、上限 4 倍 | 持续风控时主动冷却 |；HTTP 412 且响应非 JSON（WAF 层拦截）时按 -412 计入同一窗口
 | **响应层 c** | 认证失效：API code `-101` / `-111` → 立即中止，提示 `python main.py auth` 重新授权 | — | 凭证类错误不重试 |
 
 收藏写操作沿用更保守参数；所有限速参数集中在 `config.yaml`，可随时调。
@@ -341,19 +442,19 @@ CREATE TABLE kv_meta (
 | 阶段 | 请求量 | 计算 | 预估耗时 |
 | :--- | :--- | :--- | :--- |
 | 网易云抓取 | ~10 | 分页 3 次 + song/detail 3 批 | <10s |
-| 搜索匹配 | ~3000 × 1.1（重试/救场 10%） | 3300 × (0.4s + 0.2s均值抖动) ÷ 并发4 ≈ 495s | 6~10 min |
+| 搜索匹配 | ~3000 × 1.3（降级重试约 30%，随降级链轮次增多而上升，实测后可校准） | 3900 × (0.4s + 0.2s均值抖动) ÷ 并发4 ≈ 585s | 8~13 min |
 | 阶段二补查 | ≤3000（差值明显时跳过，预估实际命中 30%） | 900 × 0.5s ÷ 4 ≈ 113s | 含在上项 |
-| 收藏 | 3000 | 3000 × (0.5s + 0.15s) ÷ 并发2.5 ≈ 780s | 5~8 min |
+| 收藏 | 3000 | 3000 × (1.0s + 0.3s均值抖动) ÷ 并发1 ≈ 3900s | 默认保守档；老账号调回并发2/500ms ≈ 10 min |
 | 风控退避开销 | — | 按 5% 请求触发一次 60s 暂停估算 | +1~2 min |
-| **合计** | | | **12~20 min** |
+| **合计（默认保守档）** | | | **~70 min**（收藏为主；老账号调回并发2/500ms 后 ≈ 20~30 min） |
 
 ---
 
 ## 9. 错误处理
 
-### 9.1 风控（412 / -412）
+### 9.1 风控（412 / -412 / -702）
 
-见 §7 响应层：单请求指数退避（a）处理瞬时抖动，全局熔断（b）处理持续风控。412 **不视为单首歌失败**，重试耗尽才降级记录。
+见 §7 响应层：单请求指数退避（a）处理瞬时抖动，全局熔断（b）处理持续风控。412 / `-702` **不视为单首歌失败**，重试耗尽才降级记录。搜索请求重试耗尽（BiliError）按单首歌降级处理：status 置 MANUAL，fail_reason 记 SEARCH_FAILED，任务继续执行不中断；重试每次重新生成 wts/w_rid。
 
 ### 9.2 认证失效（-101 / -111）
 
@@ -361,16 +462,16 @@ CREATE TABLE kv_meta (
 
 ### 9.3 收藏幂等
 
-`/x/v3/fav/resource/add` 对"已在夹中"通常返回特定 code（如 `-404` 之外的重复提示，以实测为准）。程序必须区分：
+`/x/v3/fav/resource/deal` 对"已在夹中"返回 code `0`（幂等提示，2026-09-21 实现起按 code 0 判定）。程序必须区分三分支：
 
-- **已收藏**：视为成功，状态置 DONE，不记 fail_reason；
-- **视频不存在/被删（-404 等）**：状态回 MANUAL 并注明，进入人工队列；
-- **其他失败**：记 `fail_reason` 后继续下一首，单首歌永不使整体任务失败。
+- **已收藏（code `0`）**：视为成功，状态置 DONE，不记 fail_reason；
+- **视频不存在/被删（`-404` / `62002`）**：状态回 MANUAL 并注明，进入人工队列；
+- **其他失败**：状态回 **`FAV_FAILED`** 并记 `fail_reason`（单首歌永不使整体任务失败）；`task resume` 时只对 FAV_FAILED 重跑阶段三（§4.4），成功即回 DONE。
 
 ### 9.4 凭证安全
 
 - cookie 经 Fernet 对称加密后存入 `credentials.db`（文件权限 600），密钥派生自机器特征（如 `/etc/machine-id`）或首次运行时随机生成并存放于用户目录 600 权限文件；
-- **任何日志、报告、异常堆栈不得输出完整 cookie**：`SESSDATA`、`bili_jct` 一律脱敏为前 4 位 + `***`（见 §12）；
+- **任何日志、报告、异常堆栈不得输出完整 cookie**：`SESSDATA`、`bili_jct`、`buvid3` 的 cookie 值一律替换为 `<redacted>`（见 §12），DEBUG 级也不例外；
 - 文档建议用户用小号测试。
 
 ---
@@ -381,11 +482,11 @@ CREATE TABLE kv_meta (
 
 - `python main.py run <歌单ID> --dry-run`：执行阶段一、二、四报告，**跳过阶段三**。
 - 生成 `output/preview_report.html`，逐首展示：最终候选 BV、命中方式（method）、评分明细、各候选对比。用户确认后再正式运行。
-- dry-run 不写 `manual.json`、不建收藏夹，可安全重复执行。
+- dry-run 不写 `manual.json`、不建收藏夹，可安全重复执行；亦不重查已 DONE 与 FAV_FAILED 的歌曲（前者已完成匹配，后者问题在收藏侧，重查无意义）。
 
 ### 10.2 人工回灌流程
 
-1. 正式跑完后 `output/review.html` 列出所有 MANUAL 歌曲，每首附 B 站搜索跳转链接。
+1. 正式跑完后 `output/review.html` 列出所有 **MANUAL 和 FAV_FAILED** 歌曲（FAV_FAILED 附 fail_reason），每首附 B 站搜索跳转链接。
 2. 用户在 review.html 页面内直接填写 BV 号并保存（见 §10.3），或手动编辑 `manual.json`（`{"歌名|歌手": "BV1xxxxx"}`）——两种方式等价。
 3. 重跑程序：`manual.json` 按 §4.1 优先级铁律**最高优先级**生效，直接入夹。
 
@@ -434,16 +535,29 @@ playwright install chromium       # auth 功能需要
 ### 11.4 运行程序
 
 ```bash
-# 1. 模拟运行（推荐首次使用）
+# 1. 模拟运行（推荐首次使用）—— 默认新建任务
 python main.py run <网易云歌单ID> --dry-run
 # 检查 output/preview_report.html，确认匹配质量
 
-# 2. 正式运行
+# 2. 正式运行 —— 默认新建任务
 python main.py run <网易云歌单ID>
 
 # 3. 丢弃匹配结果重跑（保留歌单数据与缓存）
 python main.py run <网易云歌单ID> --refresh
+
+# 4. 任务管理子命令
+python main.py task list                          # 列出所有任务及状态
+python main.py task resume <task_id>              # 恢复指定任务的断点，从失败处继续
+python main.py task delete <task_id>              # 删除指定任务的所有状态与中间结果
+python main.py task delete --all-finished         # 批量清理所有终态任务
+# list / resume / delete 均支持 --yes 跳过 y/N 确认
+
+# 5. 报告子命令（review.html / report.csv）
+python main.py report --task-id <task_id>   # 仅报告指定任务的歌曲（默认全部任务）
+python main.py report --serve               # 生成 review.html 并启动本地保存服务（§10.3）
 ```
+
+**任务生命周期**：每次 `run`（无论 `--dry-run` 还是正式运行）自动生成唯一 `task_id` 并写入 `tasks` 表；`resume` 加载指定任务的 `songs` 状态，已 DONE 的歌跳过；`delete` 物理清除该任务的所有数据。`search_cache` 不受 `delete` 影响（跨任务共享，见 §4.4）。
 
 ---
 
@@ -465,7 +579,6 @@ python main.py run <网易云歌单ID> --refresh
 - **脱敏铁律**：日志 Filter 在 Formatter 前对 `SESSDATA=[^;]*`、`bili_jct=[^;]*`、`buvid3=[^;]*` 统一替换为 `<redacted>`；DEBUG 级也不例外。测试用例覆盖该 Filter。
 
 ---
-
 ## 13. 测试策略
 
 ### 13.1 单元测试
@@ -474,13 +587,17 @@ python main.py run <网易云歌单ID> --refresh
 - `bili_search.py`：WBI 签名使用已知输入输出向量验证（社区公开测试向量）；
 - `fav.py`：幂等分类逻辑（已收藏/视频不存在/其他失败三分支）；
 - 日志脱敏 Filter。
+- matcher.py：MatchGate 双闸门边界 + 8 个实测一真实错配病例回归（期望判定与病例一致）+ 正向病例不误伤；
 
 ### 13.2 集成测试
 
 - 使用 `pytest + respx`（与 httpx 配套）模拟全部外部 API；
 - 覆盖：歌单抓取 → 状态机闯关 → dry-run 报告 的完整链路；
-- 异常注入：`-412` 连续触发（验证熔断）、`-101`（验证立即中止）、超时、收藏"已存在"响应；
-- 断点续跑：中途杀掉进程，重启验证无重复请求。
+- 异常注入：`-412` / `-702` 连续触发（验证熔断与降速）、`-101`/`-111`（验证立即中止）、超时、收藏"已存在"（code 0）与"视频不存在"响应；
+- 任务 resume：中途杀掉进程，`task resume <task_id>` 重启验证无重复请求（替代原断点续跑用例）；
+- 任务 delete：`task delete <task_id>` 验证该任务的 songs/tasks 行被清除，search_cache 行保留；
+- 任务 list：`task list` 验证任务列表及状态展示正确；
+- 收藏失败 → FAV_FAILED → `task resume` 验证只重发 deal 请求、无搜索请求，成功后回 DONE。
 
 ### 13.3 Mock 铁律
 

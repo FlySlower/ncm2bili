@@ -9,4 +9,6 @@ description: 仅在ncm2bili中生效
 4. httpx AsyncClient 一律通过构造参数注入，不允许在业务模块内全局创建。
 5. 优先级铁律：manual.json > whitelist.json > uploaders.json > 评分（唯一出处：文档 §4.1）。
 6. 日志/异常/报告中严禁出现明文 cookie（SESSDATA / bili_jct / buvid3）。
-7. 每次状态机跃迁必须立即落盘 SQLite。8. Python ≥ 3.11，代码风格遵循 pyproject.toml 中的 ruff 配置。
+7. 每次状态机跃迁必须立即落盘 SQLite。
+8. Python ≥ 3.11，代码风格遵循 pyproject.toml 中的 ruff 配置。
+9. 全部 HTTP 调用都要过风控层
