@@ -96,6 +96,9 @@ def _make_matcher(db: Database, **kwargs) -> Matcher:
 async def test_whitelist_bv_branch_skips_search(respx_mock, tmp_path) -> None:
     """WHITELIST_BV：命中白名单即 DONE，不发任何搜索/评分请求（跳过打分）。"""
     db = Database(tmp_path / "t.db")
+    # 预置历史失败残留（如曾被降级链置 MANUAL），转 DONE 后必须清空
+    db.upsert_song("夜曲|周杰伦", status="MANUAL", method="MANUAL",
+                   fail_reason="匹配失败：降级链全部未命中")
     matcher = _make_matcher(db, whitelist={"夜曲|周杰伦": "BV1wl"})
     async with matcher:
         result = await matcher.match_song(SONG)
@@ -105,6 +108,7 @@ async def test_whitelist_bv_branch_skips_search(respx_mock, tmp_path) -> None:
     assert len(respx_mock.calls) == 0  # 无任何网络请求
     row = db.query_one("SELECT * FROM songs WHERE song_key = '夜曲|周杰伦'")
     assert row["status"] == "DONE" and row["method"] == "WHITELIST_BV"
+    assert row["fail_reason"] is None  # 转 DONE 清因（文档 §6）
 
 
 @pytest.mark.asyncio
@@ -154,6 +158,9 @@ async def test_uploader_wl_branch_skips_scoring(respx_mock, tmp_path) -> None:
         c for c in respx_mock.calls
         if "view" in str(c.request.url) or "relation" in str(c.request.url)
     ]
+    row = db.query_one("SELECT status, method, fail_reason FROM songs WHERE song_key = '夜曲|周杰伦'")
+    assert row["status"] == "DONE" and row["method"] == "UPLOADER_WL"
+    assert row["fail_reason"] is None  # 转 DONE 清因（文档 §6）
 
 
 @pytest.mark.asyncio
@@ -191,6 +198,7 @@ async def test_scored_branch_when_no_whitelist(respx_mock, tmp_path) -> None:
     ]
     row = db.query_one("SELECT * FROM songs WHERE song_key = '夜曲|周杰伦'")
     assert row["status"] == "DONE" and row["method"] == "SCORED"
+    assert row["fail_reason"] is None  # 转 DONE 清因（文档 §6）
     assert row["score_detail"] is not None
 
 

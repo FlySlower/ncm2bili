@@ -80,6 +80,49 @@ def test_upsert_song_state_transition_persisted(tmp_path) -> None:
         db.close()
 
 
+def test_done_paths_clear_fail_reason(tmp_path) -> None:
+    """文档 §6 状态跃迁约束：四条 DONE 路径（MANUAL/UPLOADER_WL/WHITELIST_BV/
+    SCORED）写库后 fail_reason 必须为 NULL，历史失败原因一并清空。"""
+    db = Database(tmp_path / "test.db")
+    try:
+        for i, method in enumerate(["MANUAL", "UPLOADER_WL", "WHITELIST_BV", "SCORED"]):
+            key = f"歌{i}|艺{i}"
+            # 预置历史失败原因（如曾被降级链置 MANUAL）
+            db.upsert_song(key, status="MANUAL", method="MANUAL",
+                           fail_reason="匹配失败：降级链全部未命中")
+            assert db.query_one(
+                "SELECT fail_reason FROM songs WHERE song_key = ?", (key,)
+            )["fail_reason"] is not None
+
+            # 转 DONE：无论调用方是否传 fail_reason，落库后必须为 NULL
+            db.upsert_song(key, status="DONE", method=method, bvid=f"BV{i}")
+            row = db.query_one("SELECT status, method, fail_reason FROM songs WHERE song_key = ?", (key,))
+            assert row["status"] == "DONE"
+            assert row["method"] == method
+            assert row["fail_reason"] is None
+
+        # 反向不误伤：非 DONE（MANUAL）仍保留失败原因
+        db.upsert_song("未匹配|歌手", status="MANUAL", fail_reason="闸门未达标")
+        assert db.query_one(
+            "SELECT fail_reason FROM songs WHERE song_key = '未匹配|歌手'"
+        )["fail_reason"] == "闸门未达标"
+    finally:
+        db.close()
+
+
+def test_done_with_explicit_none_fail_reason(tmp_path) -> None:
+    """显式传 fail_reason=None 的 DONE 写入也可落库清因（不再被 None 过滤丢弃）。"""
+    db = Database(tmp_path / "test.db")
+    try:
+        db.upsert_song("歌A|艺A", status="MANUAL", fail_reason="SEARCH_FAILED")
+        db.upsert_song("歌A|艺A", status="DONE", method="MANUAL", bvid="BV1",
+                       fail_reason=None)
+        row = db.query_one("SELECT fail_reason FROM songs WHERE song_key = '歌A|艺A'")
+        assert row["fail_reason"] is None
+    finally:
+        db.close()
+
+
 def test_execute_and_query_wrapper(tmp_path) -> None:
     """execute/query 封装：写后立即可查，行按列名访问。"""
     db = Database(tmp_path / "test.db")

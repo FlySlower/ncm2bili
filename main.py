@@ -117,7 +117,8 @@ async def run_dry_run(
             manual_bv = manual.get(key)
             if manual_bv and manual_bv != row["bvid"]:
                 db.upsert_song(
-                    key, task_id=task_id, status="DONE", method="MANUAL", bvid=manual_bv
+                    key, task_id=task_id, status="DONE", method="MANUAL", bvid=manual_bv,
+                    fail_reason=None,  # 转 DONE 清因（文档 §6 状态跃迁约束）
                 )
 
     # 阶段一：网易云抓取（文档 §5.1）

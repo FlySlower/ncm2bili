@@ -100,7 +100,9 @@
 
 | 变更 | 类型 | 说明 |
 | :--- | :--- | :--- |
+| 修复 fail_reason 残留：状态转 DONE 时未清空历史失败原因，导致报告导出误读（实测：DONE/UPLOADER_WL 行残留"降级链全部未命中"） | 修复 | §6/§10.1 |
 | 移除废弃的音乐百科 wiki 方法（ncm.py）及测试中 WIKI_URL mock 残留 | 清理 | §5.1/§3.1；降级链早已不再调用，残留曾导致测试维护事故 |
+| 澄清 fail_reason 残留：核验四条 DONE 写库路径均显式置空（_finish 汇聚点 + db.py 中央强制），新增四路径单测锁定；report 观感残留源于默认导出全任务的历史数据 | 澄清 | §6/§10.1 |
 
 ---
 
@@ -488,6 +490,7 @@ CREATE TABLE kv_meta (
 - `python main.py run <歌单ID> --dry-run`：执行阶段一、二、四报告，**跳过阶段三**。
 - 生成 `output/preview_report.html`，逐首展示：最终候选 BV、命中方式（method）、评分明细、各候选对比。用户确认后再正式运行。
 - dry-run 不写 `manual.json`、不建收藏夹，可安全重复执行；亦不重查已 DONE 与 FAV_FAILED 的歌曲（前者已完成匹配，后者问题在收藏侧，重查无意义）。
+- 状态跃迁约束：任何路径转 DONE 时 fail_reason 必须置 NULL（成功与失败原因互斥，禁止共存）。
 
 ### 10.2 人工回灌流程
 

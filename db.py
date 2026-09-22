@@ -8,6 +8,7 @@ uploader_cache / whitelist_bv / credentials / kv_meta。
   为联合主键隔离任务数据；tasks 表记录任务生命周期（RUNNING/DONE/FAILED）；
 - search_cache 以关键词为 key，跨任务共享（缓存与 task_id 无关）；
 - 每次状态机跃迁通过 upsert_song 立即落盘（文档 §4.4 断点续跑）；
+  转 DONE 时 fail_reason 强制置 NULL（文档 §6 状态跃迁约束：成功与失败原因互斥）；
 - execute / query 封装统一提交语义，单连接 + check_same_thread=False
   以兼容 asyncio 并发下的共享使用。
 """
@@ -187,10 +188,17 @@ class Database:
             song_key: "歌名|歌手"。
             fields: 任意可更新字段（task_id/ncm_id/name/artist/status/method/
                     bvid/...），None 值的字段跳过，不覆盖已有数据。
+                    fail_reason 除外：None 也写入（置 NULL），用于转 DONE 清因。
                     未传 task_id 时默认 'default'（兼容非任务制调用）。
         """
         task_id = fields.pop("task_id", "default")
-        values: dict[str, Any] = {k: v for k, v in fields.items() if v is not None}
+        # 文档 §6 状态跃迁约束：任何路径转 DONE 时 fail_reason 必须置 NULL
+        #（成功与失败原因互斥，禁止共存），历史失败原因一并清空。
+        if fields.get("status") == "DONE":
+            fields["fail_reason"] = None
+        values: dict[str, Any] = {
+            k: v for k, v in fields.items() if v is not None or k == "fail_reason"
+        }
         values["song_key"] = song_key
         values["task_id"] = task_id
         values["updated_at"] = int(time.time())

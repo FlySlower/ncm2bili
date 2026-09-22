@@ -456,6 +456,11 @@ async def test_done_song_upgraded_by_new_manual_without_requests(respx_mock, tmp
         "歌1|艺1", task_id=task_id, ncm_id=1, name="歌1", artist="艺1",
         status="DONE", method="SCORED", bvid="BV1auto",
     )
+    # 注入历史失败残留（模拟 v0.4.1 实测场景 DONE 行带旧 fail_reason）
+    db.execute(
+        "UPDATE songs SET fail_reason = ? WHERE song_key = ? AND task_id = ?",
+        ("匹配失败：降级链全部未命中", "歌1|艺1", task_id),
+    )
     respx_mock.get(SEARCH_URL).mock(
         return_value=_ok(result=[_video("BV1xx", "歌1 官方MV")])
     )
@@ -474,12 +479,13 @@ async def test_done_song_upgraded_by_new_manual_without_requests(respx_mock, tmp
     ]
     assert song1_searches == []
     row = db.query_one(
-        "SELECT status, method, bvid FROM songs WHERE song_key = '歌1|艺1' AND task_id = ?",
+        "SELECT status, method, bvid, fail_reason FROM songs WHERE song_key = '歌1|艺1' AND task_id = ?",
         (task_id,),
     )
     assert row["status"] == "DONE"
     assert row["method"] == "MANUAL"
     assert row["bvid"] == "BV1manual"
+    assert row["fail_reason"] is None  # MANUAL 回灌重查转 DONE 清因（§4.1/§6）
     assert counts["skipped_done"] == 1  # 仅歌1 已 DONE 被跳过
 
 
