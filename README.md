@@ -5,7 +5,7 @@
 输入一个网易云音乐歌单（≤3000 首），自动为每首歌在 B 站匹配最合适的视频，
 并批量添加到 B 站收藏夹。支持断点续跑、人工回灌、dry-run 预览。
 
-> 技术文档：[docs/ncm2bili_技术文档_v0.3.md](docs/ncm2bili_技术文档.md)
+> 技术文档：[docs/ncm2bili_技术文档.md](docs/ncm2bili技术文档.md)
 
 ## 功能特性
 
