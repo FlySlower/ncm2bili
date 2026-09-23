@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS songs (
   album        TEXT,
   alia         TEXT,               -- JSON 数组
   origin       TEXT,               -- 翻唱原曲信息 JSON
-  status       TEXT,               -- PENDING/DONE/MANUAL
+  status       TEXT,               -- PENDING/MATCHED/DONE/MANUAL/FAV_FAILED（MATCHED=已匹配待收藏；与文档 §3/§4.1/§6 三处一致）
   method       TEXT,               -- MANUAL/WHITELIST_BV/UPLOADER_WL/SCORED
   bvid         TEXT,
   score_detail TEXT,               -- 评分明细 JSON（抽查调权重用）
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   status      TEXT,                -- RUNNING/DONE/FAILED
   created_at  INTEGER,             -- 创建时间戳
   finished_at INTEGER,             -- 结束时间戳（未完成时 NULL）
-  stats       TEXT                 -- 统计 JSON（total/done/manual）
+  stats       TEXT                 -- 统计 JSON（total/done/manual，正式任务含 fav 收藏汇总）
 );
 
 CREATE TABLE IF NOT EXISTS search_cache (
@@ -117,6 +117,11 @@ class Database:
         保留已有歌曲数据并归入 task_id='legacy'（历史任务），避免破坏旧库。
         迁移完成后统一补建 task_id 索引（新库在 SCHEMA_SQL 中不建索引，
         避免旧表迁移前 CREATE INDEX 因缺列报错）。
+
+        v0.4.4 迁移（F2-1，文档 §6 迁移注记 / §4.4）：老库（v0.4.2 及之前，
+        无 MATCHED 语义）songs 全部 DONE 行一次性转 MATCHED，交阶段三重新
+        收藏——deal 对已收藏返回 code 0 幂等，宁可重复收藏、不可漏收藏。
+        经 kv_meta 标记保证仅执行一次：此后 fav_one() 写入的 DONE 不再被翻转。
         """
         cols = [r["name"] for r in self.query("PRAGMA table_info(songs)")]
         if "task_id" not in cols:
@@ -152,6 +157,17 @@ class Database:
                 )
         # 统一补建 task_id 索引（任务查询/删除走该列）
         self.execute("CREATE INDEX IF NOT EXISTS idx_songs_task_id ON songs (task_id)")
+        # F2-1（§4.4/§6）：老库全 DONE → MATCHED，一次性（kv_meta 标记防重复迁移）
+        marker = self.query_one(
+            "SELECT value FROM kv_meta WHERE key = 'migrated_done_to_matched_v044'"
+        )
+        if marker is None:
+            self.execute("UPDATE songs SET status = 'MATCHED' WHERE status = 'DONE'")
+            self.execute(
+                "INSERT INTO kv_meta (key, value, fetched_at) "
+                "VALUES ('migrated_done_to_matched_v044', '1', ?)",
+                (int(time.time()),),
+            )
 
     # ---- 基础封装 -------------------------------------------------
 
@@ -256,12 +272,13 @@ class Database:
         return self.query_one("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
 
     def list_tasks(self) -> list[sqlite3.Row]:
-        """列出任务及其统计（DONE/MANUAL/FAV_FAILED/总数），新任务在前。"""
+        """列出任务及其统计（DONE/MATCHED/MANUAL/FAV_FAILED/总数），新任务在前。"""
         return self.query(
             """
             SELECT t.task_id, t.playlist_id, t.status, t.created_at, t.finished_at,
                    COUNT(s.song_key) AS total_songs,
                    SUM(CASE WHEN s.status = 'DONE' THEN 1 ELSE 0 END) AS done_songs,
+                   SUM(CASE WHEN s.status = 'MATCHED' THEN 1 ELSE 0 END) AS matched_songs,
                    SUM(CASE WHEN s.status = 'MANUAL' THEN 1 ELSE 0 END) AS manual_songs,
                    SUM(CASE WHEN s.status = 'FAV_FAILED' THEN 1 ELSE 0 END) AS fav_failed_songs
             FROM tasks t LEFT JOIN songs s ON s.task_id = t.task_id

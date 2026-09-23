@@ -104,9 +104,10 @@ def _make_matcher(db: Database, **kwargs) -> Matcher:
 
 @pytest.mark.asyncio
 async def test_whitelist_bv_branch_skips_search(respx_mock, tmp_path) -> None:
-    """WHITELIST_BV：命中白名单即 DONE，不发任何搜索/评分请求（跳过打分）。"""
+    """WHITELIST_BV：命中白名单即 MATCHED（F2-1 新语义：已匹配待收藏，收藏成功才
+    DONE），不发任何搜索/评分请求（跳过打分）。"""
     db = Database(tmp_path / "t.db")
-    # 预置历史失败残留（如曾被降级链置 MANUAL），转 DONE 后必须清空
+    # 预置历史失败残留（如曾被降级链置 MANUAL），转 MATCHED 后必须清空
     db.upsert_song("夜曲|周杰伦", status="MANUAL", method="MANUAL",
                    fail_reason="匹配失败：降级链全部未命中")
     matcher = _make_matcher(db, whitelist={"夜曲|周杰伦": "BV1wl"})
@@ -117,8 +118,8 @@ async def test_whitelist_bv_branch_skips_search(respx_mock, tmp_path) -> None:
     assert result["bvid"] == "BV1wl"
     assert len(respx_mock.calls) == 0  # 无任何网络请求
     row = db.query_one("SELECT * FROM songs WHERE song_key = '夜曲|周杰伦'")
-    assert row["status"] == "DONE" and row["method"] == "WHITELIST_BV"
-    assert row["fail_reason"] is None  # 转 DONE 清因（文档 §6）
+    assert row["status"] == "MATCHED" and row["method"] == "WHITELIST_BV"
+    assert row["fail_reason"] is None  # 成功态清因（文档 §6）
 
 
 @pytest.mark.asyncio
@@ -140,7 +141,8 @@ async def test_manual_overrides_everything(respx_mock, tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_uploader_wl_branch_skips_scoring(respx_mock, tmp_path) -> None:
-    """UPLOADER_WL：uploaders 命中且标题含歌名 → 直接 DONE，不调 view/relation。"""
+    """UPLOADER_WL：uploaders 命中且标题含歌名 → 直接 MATCHED（F2-1 新语义），
+    不调 view/relation。"""
     db = Database(tmp_path / "t.db")
     _mock_env(respx_mock)
     search_keywords: list[str] = []
@@ -169,8 +171,8 @@ async def test_uploader_wl_branch_skips_scoring(respx_mock, tmp_path) -> None:
         if "view" in str(c.request.url) or "relation" in str(c.request.url)
     ]
     row = db.query_one("SELECT status, method, fail_reason FROM songs WHERE song_key = '夜曲|周杰伦'")
-    assert row["status"] == "DONE" and row["method"] == "UPLOADER_WL"
-    assert row["fail_reason"] is None  # 转 DONE 清因（文档 §6）
+    assert row["status"] == "MATCHED" and row["method"] == "UPLOADER_WL"
+    assert row["fail_reason"] is None  # 成功态清因（文档 §6）
 
 
 @pytest.mark.asyncio
@@ -207,9 +209,24 @@ async def test_scored_branch_when_no_whitelist(respx_mock, tmp_path) -> None:
         if "view" in str(c.request.url) or "relation" in str(c.request.url)
     ]
     row = db.query_one("SELECT * FROM songs WHERE song_key = '夜曲|周杰伦'")
-    assert row["status"] == "DONE" and row["method"] == "SCORED"
-    assert row["fail_reason"] is None  # 转 DONE 清因（文档 §6）
+    assert row["status"] == "MATCHED" and row["method"] == "SCORED"
+    assert row["fail_reason"] is None  # 成功态清因（文档 §6）
     assert row["score_detail"] is not None
+
+
+@pytest.mark.asyncio
+async def test_dry_run_flag_writes_done_directly(respx_mock, tmp_path) -> None:
+    """文档 §10.1（F2-1）：dry_run=True 无阶段三，匹配完成直接置 DONE（正式语义
+    置 MATCHED，仅 fav_one() 收藏成功才 DONE）。"""
+    db = Database(tmp_path / "t.db")
+    matcher = _make_matcher(db, dry_run=True, whitelist={"夜曲|周杰伦": "BV1dry"})
+    async with matcher:
+        result = await matcher.match_song(SONG)
+
+    assert result["status"] == "DONE"
+    row = db.query_one("SELECT status, method, bvid FROM songs WHERE song_key = '夜曲|周杰伦'")
+    assert row["status"] == "DONE"
+    assert row["method"] == "WHITELIST_BV" and row["bvid"] == "BV1dry"
 
 
 # ---- 验收 3：黑名单先于 UPLOADER_WL + 记 fail_reason -----------------
@@ -425,7 +442,7 @@ async def test_search_cache_hit_skips_network(respx_mock, tmp_path) -> None:
     async with matcher:
         result = await matcher.match_song(SONG)
 
-    assert result["status"] == "DONE"
+    assert result["status"] == "MATCHED"  # F2-1：正式语义匹配成功置 MATCHED
     assert search_count["n"] == 0  # 缓存命中，零搜索请求
 
 
@@ -983,7 +1000,7 @@ async def test_match_gate_c_cases_scored_with_detail(
     async with matcher:
         result = await matcher.match_song(song)
 
-    assert result["status"] == "DONE"
+    assert result["status"] == "MATCHED"  # F2-1：正式语义置 MATCHED（待收藏）
     assert result["method"] == "SCORED"
     row = db.query_one(
         "SELECT score_detail FROM songs WHERE song_key = ?", (f"{name}|{artist}",)
@@ -993,7 +1010,7 @@ async def test_match_gate_c_cases_scored_with_detail(
     assert detail["bvid"] == "BVc"
 
 
-# ---- 正向：识别正确匹配不被误伤（仍 DONE）----
+# ---- 正向：识别正确匹配不被误伤（仍匹配成功）----
 
 MATCH_GATE_POSITIVE_CASES = [
     ("1-800", "陈奕迅"),
@@ -1012,7 +1029,7 @@ MATCH_GATE_POSITIVE_CASES = [
 async def test_match_gate_positive_cases_not_blocked(
     name: str, artist: str, respx_mock, tmp_path,
 ) -> None:
-    """正向病例：标题含歌名且达标 → DONE（SCORED），闸门不误伤。"""
+    """正向病例：标题含歌名且达标 → MATCHED（SCORED），闸门不误伤。"""
     db = Database(tmp_path / "t.db")
     _mock_env(respx_mock)
     respx_mock.get(SEARCH_URL).mock(
@@ -1024,7 +1041,7 @@ async def test_match_gate_positive_cases_not_blocked(
     async with matcher:
         result = await matcher.match_song(song)
 
-    assert result["status"] == "DONE"
+    assert result["status"] == "MATCHED"  # F2-1：正式语义置 MATCHED（待收藏）
     assert result["method"] == "SCORED"
     assert result["bvid"] == "BVpos"
 
