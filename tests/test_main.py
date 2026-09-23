@@ -102,6 +102,9 @@ def _mock_bili_env(respx_mock) -> None:
 def _make_components(tmp_path) -> tuple:
     db = Database(tmp_path / "cache.db")
     config = load_config(tmp_path / "nope.yaml", env={})
+    # F1-1：搜索 sleep 下沉到 _search_cached，测试归零限速避免拖慢
+    config.rate_limit.search.interval_ms = 0
+    config.rate_limit.search.jitter_ms = [0, 0]
     ncm = NcmClient(httpx.AsyncClient())
     bili = BiliSearchClient(httpx.AsyncClient(), db=db)
     http = httpx.AsyncClient()

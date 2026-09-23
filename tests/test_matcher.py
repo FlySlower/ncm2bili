@@ -4,7 +4,9 @@ B 站/网易云客户端通过构造参数注入真实 client + respx mock，全
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import random
 import time as _time
 
 import httpx
@@ -81,8 +83,16 @@ def _mock_env(respx_mock) -> None:
     respx_mock.get(NAV_URL).mock(return_value=httpx.Response(200, json=_nav_response()))
 
 
-def _make_matcher(db: Database, **kwargs) -> Matcher:
+def _fast_cfg() -> Config:
+    """测试用 Config：搜索限速归零，避免 F1-1 下沉的 sleep 拖慢用例。"""
     cfg = Config()
+    cfg.rate_limit.search.interval_ms = 0
+    cfg.rate_limit.search.jitter_ms = [0, 0]
+    return cfg
+
+
+def _make_matcher(db: Database, **kwargs) -> Matcher:
+    cfg = _fast_cfg()
     bili = BiliSearchClient(httpx.AsyncClient(), db=db)
     ncm = NcmClient(httpx.AsyncClient())
     http = httpx.AsyncClient()
@@ -487,7 +497,7 @@ async def test_degrade_keywords_from_config(respx_mock, tmp_path) -> None:
     respx_mock.get(SEARCH_URL).mock(side_effect=search_handler)
 
     # 自定义降级链（替换默认 9 条）
-    cfg = _Config()
+    cfg = _fast_cfg()
     cfg.degrade.keywords = ["{name} {artist}", "周杰伦演唱会版 {name}"]
 
     matcher = Matcher(cfg, db, BiliSearchClient(httpx.AsyncClient(), db=db),
@@ -625,9 +635,117 @@ async def test_cache_unowned_results_not_written(respx_mock, tmp_path) -> None:
     async with matcher:
         res = await matcher._search_cached(song, "沙龙 陈奕迅")
 
-    assert res and res[0]["bvid"] == "BVx"  # 结果照常返回（MatchGate 会拦其为 MANUAL）
+    # F1-2（§4.4）：逐条过滤后无归属候选 → 视为该关键词未命中（返回 []）
+    assert res == []
     row = db.query_one("SELECT results FROM search_cache WHERE keyword = '沙龙 陈奕迅'")
     assert row is None  # 未通过归属校验 → 不写入缓存
+
+
+# ===================================================================
+# F1-2：归属校验逐条过滤候选（§4.4）
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_filter_owned_keeps_only_matching_candidates(respx_mock, tmp_path) -> None:
+    """F1-2：搜索返回混合候选（含/不含歌名 token），仅保留归属通过项并写入缓存。"""
+    db = Database(tmp_path / "t.db")
+    _mock_env(respx_mock)
+    respx_mock.get(SEARCH_URL).mock(
+        return_value=_ok(result=[
+            _video("BVowned", "夜曲 周杰伦 官方MV"),
+            _video("BVjunk", "十年 官方MV"),          # 不含歌名 token
+            _video("BVowned2", "夜曲 现场"),
+        ])
+    )
+
+    matcher = _make_matcher(db)
+    song = {"name": "夜曲", "artist": "周杰伦"}
+    async with matcher:
+        res = await matcher._search_cached(song, "夜曲 周杰伦")
+
+    # 仅保留标题含「夜曲」的候选（逐条过滤，非整体判断）
+    assert len(res) == 2
+    assert {r["bvid"] for r in res} == {"BVowned", "BVowned2"}
+    # 缓存仅写过滤后的归属候选（不含 BVjunk）
+    row = db.query_one("SELECT results FROM search_cache WHERE keyword = '夜曲 周杰伦'")
+    cached = json.loads(row["results"])
+    assert {r["bvid"] for r in cached} == {"BVowned", "BVowned2"}
+
+
+@pytest.mark.asyncio
+async def test_filter_owned_cache_hit_returns_only_owned(respx_mock, tmp_path) -> None:
+    """F1-2：缓存命中含混合候选 → 读时同样逐条过滤，仅返回归属通过项。"""
+    db = Database(tmp_path / "t.db")
+    _mock_env(respx_mock)
+    now = int(_time.time())
+    db.execute(
+        "INSERT INTO search_cache (keyword, results, fetched_at) VALUES (?, ?, ?)",
+        ("夜曲 周杰伦", json.dumps([
+            {"bvid": "BVkeep", "title": "夜曲 官方"},
+            {"bvid": "BVdrop", "title": "十年 官方"},   # 不含「夜曲」
+        ]), now),
+    )
+
+    matcher = _make_matcher(db)
+    song = {"name": "夜曲", "artist": "周杰伦"}
+    async with matcher:
+        res = await matcher._search_cached(song, "夜曲 周杰伦")
+
+    # 缓存命中时逐条过滤，仅返回 BVkeep（不发搜索请求）
+    assert len(res) == 1
+    assert res[0]["bvid"] == "BVkeep"
+    assert len(respx_mock.calls) == 0  # 未发搜索（缓存命中）
+
+
+# ===================================================================
+# F1-1：搜索间隔 sleep 下沉到每次请求（§7 预防层）
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_search_sleep_formula_covers_cache_hit_and_miss(
+    respx_mock, tmp_path, monkeypatch,
+) -> None:
+    """F1-1（§7 预防层）：每次搜索请求前 sleep = interval_ms + uniform(jitter)。
+
+    sleep 下沉到 _search_cached 入口，覆盖缓存命中与未命中两条路径（F1-1 明确）。
+    """
+    db = Database(tmp_path / "t.db")
+    _mock_env(respx_mock)
+    # 预置未过期缓存（命中路径）
+    cached = json.dumps([{"bvid": "BV1c", "title": "夜曲 周杰伦 官方MV"}])
+    db.execute(
+        "INSERT INTO search_cache (keyword, results, fetched_at) VALUES (?, ?, ?)",
+        ("夜曲 周杰伦", cached, int(_time.time())),
+    )
+    # 未命中路径也需要 mock 搜索（返回归属通过的结果）
+    respx_mock.get(SEARCH_URL).mock(
+        return_value=_ok(result=[_video("BV1m", "夜曲 周杰伦 官方MV")])
+    )
+
+    cfg = Config()
+    cfg.rate_limit.search.interval_ms = 100
+    cfg.rate_limit.search.jitter_ms = [50, 50]  # 固定 jitter 区间
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(random, "uniform", lambda a, b: 50)  # jitter 固定 50
+
+    matcher = Matcher(
+        cfg, db, BiliSearchClient(httpx.AsyncClient(), db=db),
+        NcmClient(httpx.AsyncClient()), httpx.AsyncClient(),
+    )
+    async with matcher:
+        await matcher._search_cached(SONG, "夜曲 周杰伦")        # 缓存命中
+        await matcher._search_cached(SONG, "夜曲 周杰伦 现场")    # 缓存未命中
+
+    # 每次请求都 sleep（含缓存命中），值 = (100 + 50)/1000 = 0.15
+    assert sleeps == [0.15, 0.15]
 
 
 # ===================================================================
@@ -675,7 +793,7 @@ async def test_degrade_keywords_go_through_sanitize_and_templates(respx_mock, tm
 
     respx_mock.get(SEARCH_URL).mock(side_effect=search_handler)
 
-    cfg = Config()
+    cfg = _fast_cfg()
     cfg.degrade.keywords = ["{name} {artist}", "{name}"]  # 不含纯享等追加词
 
     matcher = Matcher(cfg, db, BiliSearchClient(httpx.AsyncClient(), db=db),
@@ -918,7 +1036,12 @@ LIVE2D_JUNK = {"bvid": "BVlive2d", "title": "【Live2D模型展示】初音未�
 
 @pytest.mark.asyncio
 async def test_live2d_junk_not_adopted_for_live_song(respx_mock, tmp_path) -> None:
-    """B 类：倾城(Live) 搜索返回 live2d 无关视频 → NO_TITLE_MATCH，置 MANUAL。"""
+    """B 类：倾城(Live) 搜索返回 live2d 无关视频 → 过滤后未命中，置 MANUAL。
+
+    F1-2（§4.4）：归属校验逐条过滤——live2d 标题不含歌名 token「倾城」，
+    被过滤掉，该关键词视为未命中，进入降级链；全轮均未命中 → MANUAL
+    （降级链全部未命中）。
+    """
     db = Database(tmp_path / "t.db")
     _mock_env(respx_mock)
     respx_mock.get(SEARCH_URL).mock(return_value=_ok(result=[LIVE2D_JUNK]))
@@ -929,7 +1052,7 @@ async def test_live2d_junk_not_adopted_for_live_song(respx_mock, tmp_path) -> No
         result = await matcher.match_song(song)
 
     assert result["status"] == "MANUAL"
-    assert "NO_TITLE_MATCH" in result["fail_reason"]
+    assert "降级链全部未命中" in result["fail_reason"]
 
 
 # ---- MatchGate 阈值 config 驱动（无硬编码） ----
@@ -943,7 +1066,7 @@ async def test_match_gate_thresholds_from_config(respx_mock, tmp_path) -> None:
         return_value=_ok(result=[_cand("BVh", "夜曲 周杰伦 官方MV", play=1_000_000, fav=10_000)])
     )
 
-    cfg = Config()
+    cfg = _fast_cfg()
     cfg.match.min_score = 100.0  # 提高门槛 → 原本高分候选被拦
 
     matcher = Matcher(cfg, db, BiliSearchClient(httpx.AsyncClient(), db=db),

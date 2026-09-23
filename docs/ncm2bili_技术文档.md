@@ -106,27 +106,71 @@
 
 ### v0.4.2 → v0.4.3 变更（2026-09-23，两轮代码审查修订）
 
-| 变更 | 类型 | 说明 |
+> **落地状态警示（2026-09-23 增补）**：经 Kimi / Qwen 双独立审查逐条回溯代码，本表 19 条中**仅 2 条完整落地**（§11.1 依赖描述、list-all/nav 兜底取 mid），多数未落地、部分与实现方向相反。下表"落地"列如实标注（✅ 已落地 / ⚠️ 部分落地 / ❌ 未落地 / ❌ 反向），修复计划见 v0.4.4 变更表。
+
+| 变更 | 类型 | 说明 | 落地 |
+| :--- | :--- | :--- | :--- |
+| 新增 MATCHED（已匹配待收藏）中间态：matcher._finish() 写 MATCHED，fav_one() 收藏成功写 DONE；任务在阶段三完成前不得置 DONE（dry-run 无阶段三，匹配完成即 DONE） | **架构级** | §3/§4.1/§6/§9.3/§10.1 | ❌ 未落地（代码无 MATCHED，`_finish()` 写 DONE；中断即漏收藏） |
+| resume 语义改写：补齐未完成匹配 + 执行/重试收藏（MATCHED 与 FAV_FAILED），不再限于 FAV_FAILED 重试；阶段二跳过 DONE/MATCHED/FAV_FAILED | 功能 | §4.4/§9.3/§10.1/§11.4/§13.2 | ⚠️ 部分（框架在；MATCHED 收藏未做，仅重试 FAV_FAILED） |
+| 收藏夹分配明确为按序连续分段（第 1~900 首进夹 1、901~1800 进夹 2……），禁止任何交错/轮转分配；resume 建夹数量按任务总匹配数计算，保证歌进原夹 | 修正 | §5.3 | ❌ 反向（代码为 round-robin；建夹数按待重试子集算） |
+| 搜索间隔明确作用于每一次搜索请求（含降级链每一轮）：sleep = interval_ms + uniform(jitter)，不是每首歌一次 | 修正 | §7 预防层 | ❌ 未落地（每首歌只睡 jitter，interval_ms 未参与） |
+| 响应层 a 澄清：重试上限 3 次指重试次数（初次 + 3 次重试 = 共 4 次尝试，退避 2s→4s→8s），搜索与收藏统一 | 澄清 | §7 响应层 a | ⚠️ 部分（收藏 4 次 ✓；搜索默认 3 次且不接 config） |
+| MatchGate 不采纳时 bvid 显式置空落库（禁止沿用历史值），与 fail_reason 同属清空类字段 | 修复 | §4.2 | ❌ 未落地（db.py 白名单机制结构性禁止 bvid 置 NULL） |
+| 搜索结果归属校验改为逐条校验：仅保留标题含全部歌名 token 的候选，过滤后为空视为未命中 | 修复 | §4.4 | ❌ 反向（拼接全部标题做整体判断，且不过滤候选） |
+| UPLOADER_WL 命中判断改为归一化对归一化：`_normalize(name) in _normalize(title)` | 修复 | §4.1 ④ | ⚠️ 半落地（右侧归一化，左侧 name 未归一化，大写歌名漏判） |
+| 脱敏铁律扩充至异常堆栈：Filter 需覆盖 exc_info | 补充 | §9.4/§12 | ❌ 未落地（Filter 只改 record.msg） |
+| review_server 写入侧增加一次性 token + Origin 校验 + song_key 长度上限；review.html 改用 data-* 属性传参，废除 onclick 字符串拼接 | 安全 | §10.3 | ❌ 未落地（三项均不存在，仍是 onclick 拼接） |
+| 补 schema 迁移策略：老库 DONE 全量转 MATCHED（deal 幂等，宁可重复收藏）；songs_legacy → 'legacy' 任务既有迁移写入文档 | 补充 | §4.4/§6 | ⚠️ 部分（legacy 迁移 ✓ 且已写入本文；DONE→MATCHED ❌） |
+| §8 收藏阶段请求量 = N（deal）+ M（view，仅 aid 缓存 miss 时）；§5.2 补 `/x/v3/fav/folder/created/list-all`（up_mid 必填）与 nav 兜底取 mid | 补充 | §5.2/§8 | ⚠️ 部分（list-all/nav 兜底 ✓；aid 缓存 ❌，每次收藏必发 view） |
+| §11.1 如实描述依赖：asyncio.gather + PyYAML（原文误写 TaskGroup 与 tomllib） | 修正 | §11.1 | ✅ |
+| whitelist_bv 全量同步语义：json 删除的条目在表中同步删除 | 补充 | §4.4/§6 | ❌ 未落地（只 upsert 不删除） |
+| §11.4 所有数据文件路径基于项目根（`Path(__file__).resolve().parent`），CWD 无关 | 补充 | §11.4 | ❌ 未落地（数据文件全部 CWD 相对） |
+| 降并发 50% 生效机制定稿：worker 入口按 multiplier 追加 sleep 补偿（风控感知请求频率而非协程数），配集成测试断言请求量下降 | 决策 | §7 响应层 b | ❌ 未落地（concurrency_multiplier 生产代码零调用方） |
+| stage2 限速定稿：接入 rate_limit.stage2 配置，阶段二补查独立过 interval + jitter | 决策 | §7 预防层 | ❌ 未落地（stage2 配置无消费方，补查裸发请求） |
+| http.timeout_s 与 wbi_keys_ttl_s 定稿：必须传入客户端构造、不得硬编码（消除已暴露未接线的死配置） | 决策 | §7 末句 | ❌ 未落地（生产路径均未传入，仍是死配置） |
+| §13.2 收藏链路测试对齐 MATCHED 语义 | 测试 | §13.2 | ❌ 未落地（现有 183 项测试锁定旧 DONE 语义） |
+
+### v0.4.3 → v0.4.4 变更（计划，2026-09-23 双审查驱动；代码未落地，发布前须逐条复查归零）
+
+> 修复计划按四批执行，任务编号对应《修复任务看板》（桌面"Kimi审查"文件夹）；每批验收通过再进下一批。本表为唯一事实源，代码实现以本表与正文相关章节为准。
+
+**第一批（阻断性）**
+
+| # | 变更 | 对应章节 |
 | :--- | :--- | :--- |
-| 新增 MATCHED（已匹配待收藏）中间态：matcher._finish() 写 MATCHED，fav_one() 收藏成功写 DONE；任务在阶段三完成前不得置 DONE（dry-run 无阶段三，匹配完成即 DONE） | **架构级** | §3/§4.1/§6/§9.3/§10.1 |
-| resume 语义改写：补齐未完成匹配 + 执行/重试收藏（MATCHED 与 FAV_FAILED），不再限于 FAV_FAILED 重试；阶段二跳过 DONE/MATCHED/FAV_FAILED | 功能 | §4.4/§9.3/§10.1/§11.4/§13.2 |
-| 收藏夹分配明确为按序连续分段（第 1~900 首进夹 1、901~1800 进夹 2……），禁止任何交错/轮转分配；resume 建夹数量按任务总匹配数计算，保证歌进原夹 | 修正 | §5.3 |
-| 搜索间隔明确作用于每一次搜索请求（含降级链每一轮）：sleep = interval_ms + uniform(jitter)，不是每首歌一次 | 修正 | §7 预防层 |
-| 响应层 a 澄清：重试上限 3 次指重试次数（初次 + 3 次重试 = 共 4 次尝试，退避 2s→4s→8s），搜索与收藏统一 | 澄清 | §7 响应层 a |
-| MatchGate 不采纳时 bvid 显式置空落库（禁止沿用历史值），与 fail_reason 同属清空类字段 | 修复 | §4.2 |
-| 搜索结果归属校验改为逐条校验：仅保留标题含全部歌名 token 的候选，过滤后为空视为未命中 | 修复 | §4.4 |
-| UPLOADER_WL 命中判断改为归一化对归一化：`_normalize(name) in _normalize(title)` | 修复 | §4.1 ④ |
-| 脱敏铁律扩充至异常堆栈：Filter 需覆盖 exc_info | 补充 | §9.4/§12 |
-| review_server 写入侧增加一次性 token + Origin 校验 + song_key 长度上限；review.html 改用 data-* 属性传参，废除 onclick 字符串拼接 | 安全 | §10.3 |
-| 补 schema 迁移策略：老库 DONE 全量转 MATCHED（deal 幂等，宁可重复收藏）；songs_legacy → 'legacy' 任务既有迁移写入文档 | 补充 | §4.4/§6 |
-| §8 收藏阶段请求量 = N（deal）+ M（view，仅 aid 缓存 miss 时）；§5.2 补 `/x/v3/fav/folder/created/list-all`（up_mid 必填）与 nav 兜底取 mid | 补充 | §5.2/§8 |
-| §11.1 如实描述依赖：asyncio.gather + PyYAML（原文误写 TaskGroup 与 tomllib） | 修正 | §11.1 |
-| whitelist_bv 全量同步语义：json 删除的条目在表中同步删除 | 补充 | §4.4/§6 |
-| §11.4 所有数据文件路径基于项目根（`Path(__file__).resolve().parent`），CWD 无关 | 补充 | §11.4 |
-| 降并发 50% 生效机制定稿：worker 入口按 multiplier 追加 sleep 补偿（风控感知请求频率而非协程数），配集成测试断言请求量下降 | 决策 | §7 响应层 b |
-| stage2 限速定稿：接入 rate_limit.stage2 配置，阶段二补查独立过 interval + jitter | 决策 | §7 预防层 |
-| http.timeout_s 与 wbi_keys_ttl_s 定稿：必须传入客户端构造、不得硬编码（消除已暴露未接线的死配置） | 决策 | §7 末句 |
-| §13.2 收藏链路测试对齐 MATCHED 语义 | 测试 | §13.2 |
+| F1-1 | 搜索间隔补回 interval_ms，并把 sleep 下沉到每次搜索请求（含降级链每一轮、缓存命中路径）：sleep = interval_ms + uniform(jitter) | §7 预防层 |
+| F1-2 | 归属校验改为逐条过滤候选（仅保留归一化标题含全部歌名 token 的候选），过滤后为空视为该关键词未命中；缓存读/写同规则 | §4.4 |
+| F1-3 | 收藏夹分配改按序连续分段（第 i 首进夹 ⌊i/900⌋+1），禁止轮转；resume 建夹数量按任务总匹配数计算，保证歌进原夹 | §5.3 |
+| F1-4 | review_server 实现一次性 token + Origin 校验 + song_key 长度上限；review.html 改 data-* 属性 + 事件委托，废除 onclick 字符串拼接 | §10.3 |
+
+**第二批（MATCHED 全链路）**
+
+| # | 变更 | 对应章节 |
+| :--- | :--- | :--- |
+| F2-1 | MATCHED 落地全链路：matcher._finish() 写 MATCHED；fav_one() 成功写 DONE；阶段三查询 MATCHED；resume 阶段二跳过 DONE/MATCHED/FAV_FAILED、阶段三对 MATCHED+FAV_FAILED 执行收藏；tasks 状态置 DONE 移到阶段三完成后（dry-run 无阶段三，阶段二完成即 DONE）；manual 重查升级置 MATCHED 交阶段三；db.py 状态枚举注释同步；老库迁移 DONE→MATCHED；测试对齐 | §3/§4.1/§4.4/§6/§9.3/§10.1/§13.2 |
+
+**第三批（正确性）**
+
+| # | 变更 | 对应章节 |
+| :--- | :--- | :--- |
+| F3-1 | whitelist_bv 全量重建：启动时按 source 先 DELETE 再批量 upsert，json 删除的条目同步删除 | §4.4/§6 |
+| F3-2 | upsert_song 清空类字段白名单化（bvid/score_detail 与 fail_reason 同属可显式置 NULL），MatchGate 不采纳与 MANUAL 落库路径显式传 bvid=None | §4.2/§6 |
+| F3-3 | UPLOADER_WL 命中判断双侧归一化：`_normalize(name) in _normalize(title)` | §4.1 ④ |
+| F3-4 | 日志脱敏 Filter 覆盖 exc_info / exc_text / stack_info，补测试 | §9.4/§12 |
+| F3-5 | 所有数据文件路径基于项目根解析（`Path(__file__).resolve().parent`），CWD 无关 | §11.4 |
+| F3-6 | bvid→aid 转换结果缓存（内存 + 落盘均可，进程内至少内存缓存），仅缓存 miss 发 view 请求，收藏请求量回到 N+M | §5.2/§8 |
+| F3-7 | 熔断降并发 50% 接入 worker：critical 后按 concurrency_multiplier 追加 sleep 补偿；补集成测试断言单位时间请求量下降 | §7 响应层 b |
+| F3-8 | 评分侧标题匹配归一化（title_bonus 含歌名与"官方/原唱/MV/音频/歌词/完整版"均大小写/标点不敏感，与 MatchGate 闸门 1 同源）；修复后复核 min_score=16 阈值标定 | §4.2 |
+
+**第四批（死配置接线与质量）**
+
+| # | 变更 | 对应章节 |
+| :--- | :--- | :--- |
+| F4-1 | http.timeout_s / cache.wbi_keys_ttl_s / risk_control.retry 接线：全部传入客户端构造（httpx.AsyncClient、BiliSearchClient），不得硬编码 | §7 末句 |
+| F4-2 | 搜索侧退避与收藏统一：初次 + 3 次重试 = 共 4 次尝试，退避 2s→4s→8s 三档全部可达 | §7 响应层 a |
+| F4-3 | stage2 补查接入 rate_limit.stage2（interval + jitter + 并发上限），config 传入 rank_candidates 链路 | §7 预防层 |
+| F4-4 | buvid3 持久化位置对齐文档（写入 credentials.db；或若评估后维持 cache.db，回改本句表述） | §5.2 |
+| F4-5 | 杂项：config.yaml/main.py 版本与里程碑注释同步；ensure_folders(total=0) 不建空夹；fav_songs 去掉死参数 db、不读客户端私有属性；main.py 变量遮蔽 manual 改名；fav_one 冗余 code 判定清理 | §3.1/§5.3 |
 
 ---
 
@@ -295,6 +339,7 @@ score = w1·log10(播放量+1)
       + w2·log10(收藏量+1)
       + w3·log10(评论量+1)
       + title_bonus        # 标题含歌名 +10；含"官方/原唱/MV/音频/歌词/完整版" 每项 +3
+                       # （v0.4.4 起匹配经 _normalize 归一化：大小写/全半角/标点不敏感，与 MatchGate 闸门 1 同源）
       + duration_bonus     # 1~8 分钟内 +5；<30s 或 >10min −10
       − author_penalty     # 粉丝极少但播放异常高的营销号特征 −15
 ```
@@ -310,17 +355,17 @@ score = w1·log10(播放量+1)
 
 **置信度准入（MatchGate）**：
 
-打分排序后、写库前，对 top1 候选做双闸门校验，任一不满足即不采纳：
+打分排序后、写库前，对 top1 候选做**三闸门**校验（判定顺序固定），任一不满足即不采纳：
 
-- `top1.score < match.min_score`（低置信）→ MANUAL
-- `top1.score - top2.score < match.min_margin`（头部不分伯仲）→ MANUAL
+- **闸门 1（相关性前置）**：top1 候选标题归一化（去 HTML 标签/实体、小写、去标点）后须包含歌名主体 token，否则 MANUAL（fail_reason=`NO_TITLE_MATCH`）。歌名 ≤2 个 CJK 字符时追加联合条件：标题还须包含艺人 token 之一，否则同判 MANUAL——防"我们/海胆/黑洞/四季"类泛词短歌名命中同词非歌内容；纯拉丁短名（如 "1-800"/"in heat."）不含 CJK，不受本闸约束。token 匹配规则（全包含/逐 token）以代码实现为准并有单测覆盖。
+- **闸门 2（低置信）**：`top1.score < match.min_score` → MANUAL
+- **闸门 3（头部不分伯仲）**：`top1.score - top2.score < match.min_margin` → MANUAL
 
-不采纳时：**bvid 显式置空落库**（与 `fail_reason` 同属清空类字段——upsert 语义允许显式传 NULL 写入，禁止沿用历史值），`fail_reason` 记 `LOW_CONFIDENCE: top1={s1} top2={s2}`；`score_detail`（含 top3 候选）完整落库，供 review.html 展示与人工裁决。
+不采纳时：**bvid 显式置空落库**（与 `fail_reason` 同属清空类字段——upsert 语义允许显式传 NULL 写入，禁止沿用历史值），`fail_reason` 按被拒闸门记 `NO_TITLE_MATCH: ...` 或 `LOW_CONFIDENCE: top1={s1} top2={s2}`；`score_detail`（含 top3 候选）完整落库，供 review.html 展示与人工裁决。
 
 参数 config 驱动（`config.yaml` 的 `match` 段，默认值以 config.yaml 为准，代码与 docstring 禁止硬编码）。WHITELIST_BV / UPLOADER_WL 路径不经打分，不适用本门槛。MANUAL 语义不变，review/resume 现有路径直接复用。
 
 设计动机（实测一，2026-09-22）：62 首真实歌单错配率约 37%，错配全部源于低分或近分候选被直接采纳——top1 仅 9.9 分照收（in heat.）；正确候选在 #2 且分差 <2 分（Graveyard Phonk，17.87 vs 15.87）。
-第三闸门（相关性前置）：top1 候选标题归一化（去 HTML 标签/实体、小写、去标点）后须包含歌名主体 token，否则 MANUAL（fail_reason=NO_TITLE_MATCH），先于分数/margin 判定。歌名 ≤2 个 CJK 字符时追加联合条件：标题还须包含艺人 token 之一，否则同判 MANUAL——防"我们/海胆/黑洞/四季"类泛词短歌名命中同词非歌内容。token 匹配规则（全包含/逐 token/边界）以代码实现为准并有单测覆盖。
 
 ### 4.3 关键词降级链
 
@@ -361,6 +406,7 @@ score = w1·log10(播放量+1)
   - 老库升级（v0.4.2 及之前，无 MATCHED 语义）：`songs` 表全部 DONE 行一次性转 `MATCHED`，交阶段三重新执行收藏——deal 对已收藏返回 code 0 幂等，**宁可重复收藏、不可漏收藏**；
   - 既有迁移保留：legacy 库的 `songs_legacy` 表整体迁入 `task_id='legacy'` 任务，历史数据可查、可 resume、可 delete。
 **实测记录（2026-09-22）：B 站边缘缓存可能对不同相似查询返回逐字节相同的陈旧内容，归属校验是客户端唯一防线，不得移除。**
+
 ---
 
 ## 5. 外部接口清单
@@ -650,7 +696,7 @@ python main.py report --serve               # 生成 review.html 并启动本地
 - `bili_search.py`：WBI 签名使用已知输入输出向量验证（社区公开测试向量）；
 - `fav.py`：幂等分类逻辑（已收藏/视频不存在/其他失败三分支）；
 - 日志脱敏 Filter。
-- matcher.py：MatchGate 双闸门边界 + 8 个实测一真实错配病例回归（期望判定与病例一致）+ 正向病例不误伤；
+- matcher.py：MatchGate 三闸门边界 + 8 个实测一真实错配病例回归（期望判定与病例一致）+ 正向病例不误伤；
 
 ### 13.2 集成测试
 

@@ -215,7 +215,8 @@ button {{ padding: 3px 12px; font-size: 13px; cursor: pointer; }}
 </table>
 <script>
 const SAVE_URL = "{save_url}";
-async function saveManual(songKey, btn) {{
+const TOKEN = "{token}";
+async function saveManual(btn) {{
   const tr = btn.closest("tr");
   const input = tr.querySelector("input");
   const status = tr.querySelector(".status");
@@ -228,8 +229,8 @@ async function saveManual(songKey, btn) {{
   try {{
     const resp = await fetch(SAVE_URL, {{
       method: "POST",
-      headers: {{ "Content-Type": "application/json" }},
-      body: JSON.stringify({{ song_key: songKey, bvid: bvid }}),
+      headers: {{ "Content-Type": "application/json", "X-Token": TOKEN }},
+      body: JSON.stringify({{ song_key: btn.dataset.songKey, bvid: bvid }}),
     }});
     const data = await resp.json();
     if (resp.ok) {{
@@ -244,6 +245,11 @@ async function saveManual(songKey, btn) {{
     status.className = "status err";
   }}
 }}
+// F1-4（§10.3）：事件委托，点击保存按钮触发（废除 onclick 拼接）
+document.addEventListener("click", (e) => {{
+  const btn = e.target.closest("button[data-song-key]");
+  if (btn) saveManual(btn);
+}});
 </script>
 </body>
 </html>
@@ -256,7 +262,7 @@ _REVIEW_ROW_TPL = """<tr>
 <td>{artist}</td>
 <td><a href="{search_url}" target="_blank" rel="noopener">B 站搜索</a></td>
 <td><input placeholder="BV1xxxxxxxxx"></td>
-<td><button onclick="saveManual('{song_key_js}', this)">保存</button>
+<td><button data-song-key="{song_key_attr}">保存</button>
 <span class="status"></span></td>
 <td>{fail_reason}</td>
 </tr>"""
@@ -267,15 +273,21 @@ def write_review_html(
     path: str | Path,
     *,
     save_url: str | None = None,
+    token: str = "",
     search_base: str = "https://search.bilibili.com/all?keyword={kw}",
 ) -> Path:
     """生成人工回灌页 review.html（MANUAL / FAV_FAILED 歌曲，不内嵌任何 cookie/凭证）。
+
+    F1-4（§10.3）：song_key 经 data-* 属性 + 事件委托传递，废除 onclick 拼接；
+    token 注入页面 JS 供 fetch 携带 X-Token 头。
 
     Args:
         rows: songs 表行；仅 status=MANUAL / FAV_FAILED（或 method=MANUAL）的歌曲进入列表，
               FAV_FAILED 行内展示收藏失败原因（文档 §10.2）。
         save_url: 保存服务地址（如 http://127.0.0.1:8080/save）；
                   None 时页面提示"服务未启动"。
+        token: 一次性 token（F1-4 §10.3），由 start_review_server 返回；空串时页面
+               仍生成但 fetch 不带 X-Token（服务端会 403）。
         search_base: B 站搜索跳转链接模板，{kw} 会被替换为 URL 编码关键词。
     """
     from urllib.parse import quote
@@ -294,8 +306,7 @@ def write_review_html(
         artist = row.get("artist") or ""
         keyword = f"{name} {artist}".strip()
         song_key = row.get("song_key") or f"{name}|{artist}"
-        # song_key_js 内嵌进 onclick 字符串，需转义引号
-        song_key_js = song_key.replace("\\", "\\\\").replace("'", "\\'")
+        # F1-4（§10.3）：data-* 属性传参，html.escape 转义属性值（含引号）
         body_parts.append(
             _REVIEW_ROW_TPL.format(
                 idx=idx,
@@ -303,7 +314,7 @@ def write_review_html(
                 name=html.escape(name),
                 artist=html.escape(artist),
                 search_url=search_base.format(kw=quote(keyword)),
-                song_key_js=song_key_js,
+                song_key_attr=html.escape(song_key, quote=True),
                 fail_reason=html.escape(row.get("fail_reason") or ""),
             )
         )
@@ -314,11 +325,13 @@ def write_review_html(
     else:
         server_hint = "未启动（本页保存不可用）"
         safe_url = ""
+    safe_token = html.escape(token)
 
     page = _REVIEW_HTML_TPL.format(
         count=len(manual_rows),
         server_hint=html.escape(server_hint),
         save_url=safe_url,
+        token=safe_token,
         rows="\n".join(body_parts),
     )
     path.write_text(page, encoding="utf-8")

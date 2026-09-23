@@ -20,11 +20,14 @@
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
+import random
 import re
 import time
+
 from typing import Any
 
 from bili_search import BiliError
@@ -421,7 +424,18 @@ class Matcher:
           沙龙/阿牛、单车(Live)/等(Live)），脏缓存作废重取、新结果不写入。
         search_cache 表以 keyword 为 key，TTL 取 config.cache.search_cache_ttl_s
         （默认 7 天）。--refresh 只清匹配结果、不清 search_cache。
+
+        预防层（§7 + F1-1）：sleep 下沉到每次搜索请求——含降级链每一轮、
+        缓存命中路径。sleep = interval_ms + uniform(jitter)，作用于本方法
+        入口（调用即睡，与是否命中缓存/发真实请求无关）。
         """
+        # 文档 §7 预防层 / F1-1：每次搜索请求前 sleep = interval_ms + uniform(jitter)。
+        # 下沉到 _search_cached 入口，覆盖降级链每一轮与缓存命中路径（F1-1 明确）。
+        rl = self._config.rate_limit.search
+        await asyncio.sleep(
+            (rl.interval_ms + random.uniform(*rl.jitter_ms)) / 1000
+        )
+
         ttl = self._config.cache.search_cache_ttl_s
         name = sanitize_song_name(
             song.get("name") or "", self._config.degrade.keep_tokens
@@ -436,9 +450,11 @@ class Matcher:
             except json.JSONDecodeError:
                 results = None  # 缓存损坏则视为未命中
             if isinstance(results, list):
-                if self._results_owned(results, name):
-                    return results
-                # 归属校验失败：脏缓存（异关键词结果混入），作废并重新搜索
+                # F1-2（§4.4）：逐条过滤候选，仅保留归一化标题含全部歌名 token 的项
+                owned = self._filter_owned(results, name)
+                if owned:
+                    return owned
+                # 过滤后为空：脏缓存（异关键词结果混入），作废并重新搜索
                 logger.warning("search_cache 结果归属校验失败，作废重取: %s", keyword)
                 self._db.execute("DELETE FROM search_cache WHERE keyword = ?", (keyword,))
 
@@ -446,33 +462,40 @@ class Matcher:
         results = data.get("result") if isinstance(data, dict) else None
         if not isinstance(results, list):
             return results
-        if results and self._results_owned(results, name):
-            # 仅缓存通过归属校验的非空结果（§4.4：空结果不缓存、脏结果不缓存）
+        # F1-2（§4.4）：逐条过滤候选；仅缓存过滤后非空结果
+        # （空结果不缓存、脏结果不缓存；过滤后为空视为该关键词未命中，照常进入降级链）
+        owned = self._filter_owned(results, name)
+        if owned:
             self._db.execute(
                 "INSERT INTO search_cache (keyword, results, fetched_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(keyword) DO UPDATE SET results = excluded.results, "
                 "fetched_at = excluded.fetched_at",
-                (keyword, json.dumps(results, ensure_ascii=False), int(time.time())),
+                (keyword, json.dumps(owned, ensure_ascii=False), int(time.time())),
             )
         elif not results:
             logger.debug("搜索结果为空，不写入 search_cache: %s", keyword)
         else:
+            # 过滤后为空（真实结果不含歌名 token）：视为该关键词未命中，不写入缓存
             logger.warning("搜索结果未通过归属校验，不写入缓存: %s", keyword)
-        return results
+        return owned
 
     @staticmethod
-    def _results_owned(results: list, name: str) -> bool:
-        """文档 §4.4 结果归属校验：结果须与当前歌名相关。
+    def _filter_owned(results: list, name: str) -> list:
+        """文档 §4.4 结果归属校验（F1-2 逐条过滤）：仅保留归一化标题包含
+        全部歌名 token 的候选。
 
-        与 MatchGate NO_TITLE_MATCH 同源规则（标题归一化后含歌名全部 token），
-        拦截上游对相似关键词返回的逐字节相同 stale 内容（实测根因）写入缓存、
-        并在读取时作废旧行。歌名为空 → 无法判定，放行（降级链退化为艺人搜索）。
+        与 MatchGate NO_TITLE_MATCH 同源规则，拦截上游对相似关键词返回的逐字节
+        相同 stale 内容（实测根因）。缓存读/写同规则：过滤后为空视为该关键词
+        未命中（脏缓存行作废重取；真实空结果照常进入降级链）。歌名为空 →
+        无法判定，全放行（降级链退化为艺人搜索）。
         """
         tokens = _name_tokens(name)
         if not tokens:
-            return True
-        joined = " ".join(_normalize(v.get("title") or "") for v in results)
-        return all(tok in joined for tok in tokens)
+            return list(results)
+        return [
+            v for v in results
+            if all(tok in _normalize(v.get("title") or "") for tok in tokens)
+        ]
 
     def _finish(
         self,

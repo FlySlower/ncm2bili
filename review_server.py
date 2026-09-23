@@ -3,13 +3,16 @@
 - 仅监听 127.0.0.1 随机端口（localhost only，不暴露公网）；
 - 仅处理 POST /save，body 为 {"song_key", "bvid"}；
 - BV 号格式校验 ^BV1[a-zA-Z0-9]{9}$，不合法返回 400 且不写文件；
-- 写入 manual.json 采用"读-改-写 + 临时文件 + os.replace"原子替换，
+- 写入采用"读-改-写 + 临时文件 + os.replace"原子替换，
   防并发写损坏（文档 §10.3）；
 - 服务不读取/返回任何歌单与 cookie 数据，仅接收 BV 号。
+- F1-4（§10.3 写入侧安全）：启动时生成一次性 token 注入页面，
+  POST /save 必须携带 X-Token 头且校验通过；校验 Origin 头同源
+  （仅接受 http://127.0.0.1:<port>）；song_key 长度设上限防滥用。
 
 用法：
     from review_server import start_review_server
-    server, port = start_review_server("manual.json")
+    server, port, token = start_review_server("manual.json")
     # server.serve_forever() 阻塞；或 serve_in_background() 起后台线程
 """
 from __future__ import annotations
@@ -17,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import tempfile
 import threading
 from contextlib import suppress
@@ -26,6 +30,9 @@ from typing import Any
 
 # 文档 §10.3：BV 号格式校验
 BV_RE = re.compile(r"^BV1[a-zA-Z0-9]{9}$")
+
+# F1-4（§10.3）：song_key 长度上限（防滥用写入）
+_SONG_KEY_MAX_LEN = 300
 
 _HOST = "127.0.0.1"  # 仅回环地址（文档 §10.3）
 _MANUAL_FILENAME = "manual.json"
@@ -70,10 +77,11 @@ def update_manual(path: str | Path, song_key: str, bvid: str) -> dict:
 
 
 class ReviewHandler(BaseHTTPRequestHandler):
-    """POST /save 处理器；manual_path 与 db 由 start_review_server 注入。"""
+    """POST /save 处理器；manual_path、db、token 由 start_review_server 注入。"""
 
     manual_path: Path = Path(_MANUAL_FILENAME)
     db: Any = None  # 可选：同步写 whitelist_bv 表（source=manual，文档 §6）
+    token: str = ""  # F1-4（§10.3）：一次性 token，由 start_review_server 注入
     server_version = "review-server/1.0"
 
     # ---- 路由 -----------------------------------------------------
@@ -82,6 +90,20 @@ class ReviewHandler(BaseHTTPRequestHandler):
         if self.path != "/save":
             self._reply(404, {"error": "not found"})
             return
+
+        # F1-4（§10.3）：Origin 同源校验（仅接受 http://127.0.0.1:<port>）
+        origin = self.headers.get("Origin", "")
+        expected_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
+        if origin != expected_origin:
+            self._reply(403, {"error": "forbidden origin"})
+            return
+
+        # F1-4（§10.3）：一次性 token 校验（POST 必须携带 X-Token 头）
+        x_token = self.headers.get("X-Token", "")
+        if not x_token or x_token != self.token:
+            self._reply(403, {"error": "invalid token"})
+            return
+
         try:
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length) if length else b""
@@ -92,9 +114,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
         song_key = body.get("song_key")
         bvid = body.get("bvid")
+        # F1-4（§10.3）：song_key 长度上限（超长直接拒绝，防滥用写入）
         if (
             not isinstance(song_key, str)
             or not song_key
+            or len(song_key) > _SONG_KEY_MAX_LEN
             or not isinstance(bvid, str)
             or not BV_RE.match(bvid)
         ):
@@ -131,20 +155,22 @@ def start_review_server(
     host: str = _HOST,
     port: int = 0,
     db: Any = None,
-) -> tuple[ThreadingHTTPServer, int]:
-    """启动本地保存服务，返回 (server, 实际端口)。
+) -> tuple[ThreadingHTTPServer, int, str]:
+    """启动本地保存服务，返回 (server, 实际端口, 一次性 token)。
 
     port=0 → 随机端口（文档 §10.3）。仅监听 host（默认 127.0.0.1）。
     db: 可选 Database 实例，保存时同步写 whitelist_bv 表（source=manual）。
+    F1-4（§10.3）：启动时生成一次性 token 注入 handler，返回供页面嵌入。
     调用方负责 server.shutdown() / server.server_close()。
     """
+    token = secrets.token_hex(16)  # F1-4（§10.3）：32 字符十六进制一次性 token
     handler = type(
         "BoundReviewHandler",
         (ReviewHandler,),
-        {"manual_path": Path(manual_path), "db": db},
+        {"manual_path": Path(manual_path), "db": db, "token": token},
     )
     server = ThreadingHTTPServer((host, port), handler)
-    return server, server.server_address[1]
+    return server, server.server_address[1], token
 
 
 def serve_in_background(
@@ -153,12 +179,14 @@ def serve_in_background(
     host: str = _HOST,
     port: int = 0,
     db: Any = None,
-) -> tuple[ThreadingHTTPServer, int]:
-    """后台线程启动服务（测试/命令行用），返回 (server, 实际端口)。"""
-    server, actual_port = start_review_server(manual_path, host=host, port=port, db=db)
+) -> tuple[ThreadingHTTPServer, int, str]:
+    """后台线程启动服务（测试/命令行用），返回 (server, 实际端口, token)。"""
+    server, actual_port, token = start_review_server(
+        manual_path, host=host, port=port, db=db
+    )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    return server, actual_port
+    return server, actual_port, token
 
 
 __all__ = [

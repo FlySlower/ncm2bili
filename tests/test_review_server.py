@@ -4,6 +4,8 @@
 - POST 合法 BV → manual.json 更新正确；两次连续 POST 文件不损坏；
 - 非法 BV 返回 400 且不写文件；
 - 服务仅监听 127.0.0.1（断言绑定地址）；
+- F1-4（§10.3 写入侧安全）：一次性 token + Origin 同源 + song_key 长度上限；
+- F1-4（§10.3 前端传参）：review.html 用 data-* 属性 + 事件委托，废除 onclick；
 - review.html 生成：仅 MANUAL 歌曲、含搜索链接与输入框、不内嵌敏感信息；
 - 端到端：保存到 manual.json 后，重跑 matcher 按优先级铁律生效。
 """
@@ -24,11 +26,23 @@ VALID_BV = "BV1AbCdEfGHi"  # 12 位：BV1 + 9 位字母数字
 INVALID_BV = "BV123"        # 长度不足
 
 
-def _post_json(server, path: str, payload: dict) -> httpx.Response:
-    """向本地测试服务发 JSON POST（httpx 同步即可）。"""
+def _post_json(
+    server, path: str, payload: dict, *, token: str = "", origin: str = ""
+) -> httpx.Response:
+    """向本地测试服务发 JSON POST（httpx 同步即可）。
+
+    F1-4（§10.3）：token/origin 非空时分别注入 X-Token / Origin 头。
+    """
     port = server.server_address[1]
+    headers: dict[str, str] = {}
+    if token:
+        headers["X-Token"] = token
+    if origin:
+        headers["Origin"] = origin
     with httpx.Client() as client:
-        return client.post(f"http://127.0.0.1:{port}{path}", json=payload, timeout=5)
+        return client.post(
+            f"http://127.0.0.1:{port}{path}", json=payload, headers=headers, timeout=5,
+        )
 
 
 # ---- 验收 1：合法 BV 保存 + 连续 POST 不损坏 ---------------------------
@@ -36,10 +50,13 @@ def _post_json(server, path: str, payload: dict) -> httpx.Response:
 
 def test_server_saves_valid_bv_and_json_intact(tmp_path) -> None:
     manual_path = tmp_path / "manual.json"
-    server, port = serve_in_background(manual_path)
+    server, port, token = serve_in_background(manual_path)
+    origin = f"http://127.0.0.1:{port}"
     try:
-        r1 = _post_json(server, "/save", {"song_key": "夜曲|周杰伦", "bvid": VALID_BV})
-        r2 = _post_json(server, "/save", {"song_key": "晴天|周杰伦", "bvid": "BV1XxYyZz123"})
+        r1 = _post_json(server, "/save", {"song_key": "夜曲|周杰伦", "bvid": VALID_BV},
+                        token=token, origin=origin)
+        r2 = _post_json(server, "/save", {"song_key": "晴天|周杰伦", "bvid": "BV1XxYyZz123"},
+                        token=token, origin=origin)
     finally:
         server.shutdown()
         server.server_close()
@@ -60,9 +77,11 @@ def test_server_preserves_existing_manual(tmp_path) -> None:
     manual_path = tmp_path / "manual.json"
     write_manual_atomic(manual_path, {"旧歌|旧艺人": "BV1Old"})
 
-    server, port = serve_in_background(manual_path)
+    server, port, token = serve_in_background(manual_path)
+    origin = f"http://127.0.0.1:{port}"
     try:
-        r = _post_json(server, "/save", {"song_key": "新歌|新艺人", "bvid": VALID_BV})
+        r = _post_json(server, "/save", {"song_key": "新歌|新艺人", "bvid": VALID_BV},
+                       token=token, origin=origin)
     finally:
         server.shutdown()
         server.server_close()
@@ -78,9 +97,11 @@ def test_server_preserves_existing_manual(tmp_path) -> None:
 
 def test_server_rejects_invalid_bv(tmp_path) -> None:
     manual_path = tmp_path / "manual.json"
-    server, port = serve_in_background(manual_path)
+    server, port, token = serve_in_background(manual_path)
+    origin = f"http://127.0.0.1:{port}"
     try:
-        r = _post_json(server, "/save", {"song_key": "夜曲|周杰伦", "bvid": INVALID_BV})
+        r = _post_json(server, "/save", {"song_key": "夜曲|周杰伦", "bvid": INVALID_BV},
+                       token=token, origin=origin)
     finally:
         server.shutdown()
         server.server_close()
@@ -91,9 +112,11 @@ def test_server_rejects_invalid_bv(tmp_path) -> None:
 
 def test_server_rejects_missing_fields(tmp_path) -> None:
     manual_path = tmp_path / "manual.json"
-    server, port = serve_in_background(manual_path)
+    server, port, token = serve_in_background(manual_path)
+    origin = f"http://127.0.0.1:{port}"
     try:
-        r = _post_json(server, "/save", {"bvid": VALID_BV})  # 缺 song_key
+        r = _post_json(server, "/save", {"bvid": VALID_BV},  # 缺 song_key
+                       token=token, origin=origin)
     finally:
         server.shutdown()
         server.server_close()
@@ -113,7 +136,7 @@ def test_bv_regex() -> None:
 
 
 def test_server_binds_loopback_only(tmp_path) -> None:
-    server, port = serve_in_background(tmp_path / "manual.json")
+    server, port, token = serve_in_background(tmp_path / "manual.json")
     try:
         host = server.server_address[0]
         assert host == "127.0.0.1"
@@ -123,13 +146,102 @@ def test_server_binds_loopback_only(tmp_path) -> None:
 
 
 def test_server_rejects_non_save_path(tmp_path) -> None:
-    server, port = serve_in_background(tmp_path / "manual.json")
+    server, port, token = serve_in_background(tmp_path / "manual.json")
     try:
         r = _post_json(server, "/other", {"song_key": "a|b", "bvid": VALID_BV})
         assert r.status_code == 404
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---- F1-4：写入侧安全（一次性 token + Origin + song_key 上限）----------
+
+
+def test_server_rejects_missing_token(tmp_path) -> None:
+    """F1-4（§10.3）：缺少 X-Token 头 → 403 且不写文件。"""
+    manual_path = tmp_path / "manual.json"
+    server, port, token = serve_in_background(manual_path)
+    try:
+        r = _post_json(
+            server, "/save", {"song_key": "夜曲|周杰伦", "bvid": VALID_BV},
+            origin=f"http://127.0.0.1:{port}",  # 有 Origin 但缺 token
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert r.status_code == 403
+    assert not manual_path.exists()
+
+
+def test_server_rejects_wrong_token(tmp_path) -> None:
+    """F1-4（§10.3）：X-Token 不匹配 → 403 且不写文件。"""
+    manual_path = tmp_path / "manual.json"
+    server, port, token = serve_in_background(manual_path)
+    try:
+        r = _post_json(
+            server, "/save", {"song_key": "夜曲|周杰伦", "bvid": VALID_BV},
+            token="wrongtoken", origin=f"http://127.0.0.1:{port}",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert r.status_code == 403
+    assert not manual_path.exists()
+
+
+def test_server_rejects_wrong_origin(tmp_path) -> None:
+    """F1-4（§10.3）：Origin 非同源 → 403 且不写文件。"""
+    manual_path = tmp_path / "manual.json"
+    server, port, token = serve_in_background(manual_path)
+    try:
+        r = _post_json(
+            server, "/save", {"song_key": "夜曲|周杰伦", "bvid": VALID_BV},
+            token=token, origin="http://evil.example.com",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert r.status_code == 403
+    assert not manual_path.exists()
+
+
+def test_server_rejects_missing_origin(tmp_path) -> None:
+    """F1-4（§10.3）：无 Origin 头 → 403 且不写文件。"""
+    manual_path = tmp_path / "manual.json"
+    server, port, token = serve_in_background(manual_path)
+    try:
+        r = _post_json(
+            server, "/save", {"song_key": "夜曲|周杰伦", "bvid": VALID_BV},
+            token=token,  # 有 token 但缺 Origin
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert r.status_code == 403
+    assert not manual_path.exists()
+
+
+def test_server_rejects_oversized_song_key(tmp_path) -> None:
+    """F1-4（§10.3）：song_key 超过 300 字符 → 400 且不写文件。"""
+    manual_path = tmp_path / "manual.json"
+    server, port, token = serve_in_background(manual_path)
+    origin = f"http://127.0.0.1:{port}"
+    try:
+        r = _post_json(
+            server, "/save", {"song_key": "A" * 301, "bvid": VALID_BV},
+            token=token, origin=origin,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert r.status_code == 400
+    assert not manual_path.exists()
 
 
 # ---- 验收 4：review.html 生成 -----------------------------------------
@@ -154,7 +266,10 @@ def test_review_html_only_manual_songs(tmp_path) -> None:
         {"song_key": "晴天|周杰伦", "name": "晴天", "artist": "周杰伦",
          "status": "DONE", "method": "SCORED", "bvid": "BV1done", "fail_reason": None},
     ]
-    path = write_review_html(rows, tmp_path / "review.html", save_url="http://127.0.0.1:8080/save")
+    path = write_review_html(
+        rows, tmp_path / "review.html",
+        save_url="http://127.0.0.1:8080/save", token="mytoken123",
+    )
 
     text = path.read_text(encoding="utf-8")
     assert "夜曲|周杰伦" in text
@@ -162,7 +277,13 @@ def test_review_html_only_manual_songs(tmp_path) -> None:
     assert "B 站搜索" in text
     expected_url = "https://search.bilibili.com/all?keyword=%E5%A4%9C%E6%9B%B2%20%E5%91%A8%E6%9D%B0%E4%BC%A6"
     assert f'href="{expected_url}"' in text
-    assert "saveManual(" in text
+    # F1-4（§10.3）：data-* 属性 + 事件委托，废除 onclick
+    assert 'data-song-key=' in text
+    assert 'onclick=' not in text  # 无 onclick HTML 属性拼接
+    assert "addEventListener" in text  # 事件委托
+    # token 注入页面 JS
+    assert "mytoken123" in text
+    assert "X-Token" in text
     assert "http://127.0.0.1:8080/save" in text
 
 
@@ -185,11 +306,11 @@ def test_review_html_shows_fav_failed_songs(tmp_path) -> None:
 def test_review_html_no_sensitive_data(tmp_path) -> None:
     """review.html 不内嵌 cookie/凭证（文档 §10.3：不暴露任何歌单/cookie 数据）。"""
     rows = [_manual_song("夜曲|周杰伦", "夜曲", "周杰伦")]
-    path = write_review_html(rows, tmp_path / "review.html", save_url=None)
+    path = write_review_html(rows, tmp_path / "review.html", save_url=None, token="sometoken")
 
     text = path.read_text(encoding="utf-8")
-    for token in ("SESSDATA", "bili_jct", "buvid3", "Cookie", "credentials"):
-        assert token not in text
+    for secret in ("SESSDATA", "bili_jct", "buvid3", "Cookie", "credentials"):
+        assert secret not in text
     assert "未启动" in text  # save_url=None 时提示服务未启动
 
 
@@ -232,7 +353,11 @@ async def test_manual_saved_via_server_applies_on_rerun(tmp_path) -> None:
 def _make_config():
     from config import Config
 
-    return Config()
+    cfg = Config()
+    # F1-1：搜索 sleep 下沉到 _search_cached，测试归零限速避免拖慢
+    cfg.rate_limit.search.interval_ms = 0
+    cfg.rate_limit.search.jitter_ms = [0, 0]
+    return cfg
 
 
 def _make_clients():
