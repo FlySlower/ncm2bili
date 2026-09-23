@@ -343,7 +343,7 @@ async def test_manual_saved_via_server_applies_on_rerun(tmp_path) -> None:
     assert result["method"] == "MANUAL"
     assert result["bvid"] == VALID_BV
     row = db.query_one("SELECT status, method, bvid FROM songs WHERE song_key = '夜曲|周杰伦'")
-    assert row["status"] == "DONE"
+    assert row["status"] == "MATCHED"  # F2-1：matcher 正式语义置 MATCHED（收藏成功才 DONE）
     assert row["method"] == "MANUAL"
     assert row["bvid"] == VALID_BV
     # 无任何搜索请求（manual 最高优先级，不触发搜索）

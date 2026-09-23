@@ -781,6 +781,10 @@ async def test_formal_minus101_aborts(respx_mock, tmp_path) -> None:
 
     # -101 立即中止：每个收藏任务最多 1 次（不重试），且全部被取消
     assert fav_calls["n"] >= 1
+    # F2-1（§4.4）：-101 中止退出时任务保持 RUNNING——旧语义阶段二完成即置
+    # DONE，中断后任务"显示完成"导致漏收藏；现在可被 task resume 恢复继续收藏
+    task_row = db.query_one("SELECT status FROM tasks")
+    assert task_row["status"] == "RUNNING"
 
 
 # ---- 报告绑定 task_id（文档 §3 阶段三"报告（绑定 task_id）"）----------
@@ -963,6 +967,209 @@ def test_resume_retries_fav_failed_without_search(respx_mock, tmp_path, monkeypa
     assert row["fail_reason"] is None
     assert row["bvid"] == "BV1retry"
     db.close()
+
+
+# ---- F2-1 验收：MATCHED 全链路（文档 §4.1/§4.4/§10.1/§13.2）-------------
+
+
+@pytest.mark.asyncio
+async def test_formal_matched_chain_stage2_then_fav(respx_mock, tmp_path) -> None:
+    """验收（§13.2 链路）：正式 run 阶段二完成后库中无 DONE（MATCHED）且任务保持
+    RUNNING——阶段三完成前不得 DONE；阶段三成功后逐个转 DONE、任务才置 DONE；
+    复用 task_id 二次进入阶段二全跳过（不重复搜索）。"""
+    _mock_ncm_playlist(respx_mock)
+    _mock_bili_env(respx_mock)
+    _mock_fav_folders(respx_mock)
+
+    search_calls = {"n": 0}
+
+    def search_handler(request: httpx.Request) -> httpx.Response:
+        search_calls["n"] += 1
+        kw = request.url.params.get("keyword")
+        return _ok(result=[_video(f"BV{abs(hash(kw)) % 1000}", _kw_title(kw))])
+
+    respx_mock.get(SEARCH_URL).mock(side_effect=search_handler)
+
+    deal_calls = {"n": 0}
+
+    def deal_handler(request: httpx.Request) -> httpx.Response:
+        deal_calls["n"] += 1
+        return httpx.Response(200, json={"code": 0})
+
+    respx_mock.post(FAV_RESOURCE_URL).mock(side_effect=deal_handler)
+
+    db, config, ncm, bili, http = _make_components(tmp_path)
+    out = tmp_path / "output"
+    async with ncm, bili, http:
+        # 只跑阶段二（dry_run=False = 正式匹配语义，文档 §4.1）
+        counts = await run_dry_run(
+            1, config, db, ncm, bili, http, output_dir=out, dry_run=False,
+            whitelist={}, uploaders={}, blacklist_words=[], manual={},
+        )
+        tid = counts["task_id"]
+        statuses = [
+            r["status"] for r in db.query(
+                "SELECT status FROM songs WHERE task_id = ?", (tid,)
+            )
+        ]
+        assert "DONE" not in statuses  # 阶段三完成前不得 DONE（核心缺陷回归锁定）
+        assert set(statuses) == {"MATCHED"}
+        assert db.get_task(tid)["status"] == "RUNNING"  # DONE 时机移到阶段三后
+        searches_after_stage2 = search_calls["n"]
+
+        # 接阶段三（run_formal 复用 task_id）：MATCHED → fav_one → DONE
+        await run_formal(
+            1, config, db, ncm, bili, http,
+            cookie_str=COOKIE, output_dir=out, task_id=tid,
+            whitelist={}, uploaders={}, blacklist_words=[], manual={},
+        )
+
+    # 阶段二不再重复搜索（MATCHED 在跳过集合内）
+    assert search_calls["n"] == searches_after_stage2
+    # 阶段三成功后逐个转 DONE，deal 次数 = 匹配成功数
+    rows = db.query("SELECT status FROM songs WHERE task_id = ?", (tid,))
+    assert all(r["status"] == "DONE" for r in rows)
+    assert deal_calls["n"] == len(rows)
+    assert db.get_task(tid)["status"] == "DONE"  # 任务在阶段三完成后才置 DONE
+
+
+@pytest.mark.asyncio
+async def test_manual_upgrade_done_becomes_matched_for_fav(respx_mock, tmp_path) -> None:
+    """验收（§4.1 优先级重查）：正式运行下已 DONE 的歌若 manual.json 新增不同 BV，
+    升级为 MATCHED + method=MANUAL（bvid 换新），交阶段三收藏新 BV；不发任何
+    搜索/收藏请求。dry-run 变体（保持 DONE）见
+    test_done_song_upgraded_by_new_manual_without_requests。"""
+    # 1 首歌的歌单（避免歌单里其他歌触发搜索干扰零请求断言）
+    one_song = [SONGS[0]]
+    track_ids = [{"id": s["id"]} for s in one_song]
+    respx_mock.get(PLAYLIST_URL).mock(
+        return_value=httpx.Response(
+            200, json={"code": 200, "playlist": {"trackIds": track_ids, "name": "歌单1"}}
+        )
+    )
+    respx_mock.post(SONG_DETAIL_URL).mock(
+        return_value=httpx.Response(200, json={"code": 200, "songs": one_song})
+    )
+    _mock_bili_env(respx_mock)
+    _mock_fav_interfaces(respx_mock)  # 误调收藏/建夹即计数暴露
+    search_calls = {"n": 0}
+
+    def search_handler(request: httpx.Request) -> httpx.Response:
+        search_calls["n"] += 1
+        return _ok(result=[_video("BV1never", "歌1 艺1 官方MV")])
+
+    respx_mock.get(SEARCH_URL).mock(side_effect=search_handler)
+
+    db, config, ncm, bili, http = _make_components(tmp_path)
+    tid = db.create_task(123)
+    db.upsert_song(
+        "歌1|艺1", task_id=tid, ncm_id=1, name="歌1", artist="艺1",
+        status="DONE", method="SCORED", bvid="BV1old",
+    )
+
+    async with ncm, bili, http:
+        counts = await run_dry_run(
+            1, config, db, ncm, bili, http, output_dir=tmp_path / "output",
+            whitelist={}, uploaders={}, blacklist_words=[],
+            manual={"歌1|艺1": "BV1new"},  # manual.json 新增不同 BV
+            task_id=tid, dry_run=False,
+        )
+
+    row = db.query_one(
+        "SELECT status, method, bvid, fail_reason FROM songs "
+        "WHERE song_key = '歌1|艺1' AND task_id = ?",
+        (tid,),
+    )
+    assert row["status"] == "MATCHED"  # 正式语义：交阶段三收藏新 BV
+    assert row["method"] == "MANUAL"   # manual 优先级最高
+    assert row["bvid"] == "BV1new"
+    assert row["fail_reason"] is None  # 成功态清因（§6）
+    assert db.get_task(tid)["status"] == "RUNNING"
+    # 不回 matcher（MATCHED 在跳过集合）、无阶段三
+    assert search_calls["n"] == 0
+    assert counts["methods"] == {}
+
+
+def test_resume_deals_matched_and_fav_failed_exactly_once(
+    respx_mock, tmp_path, monkeypatch,
+) -> None:
+    """验收（§4.4）：阶段三中断后 resume——MATCHED（首次收藏）与 FAV_FAILED
+    （重试收藏）都执行 deal 且恰好一次（deal 次数 = 未完成数），已收藏（DONE）
+    不重复 deal，全部完成后任务置 DONE。"""
+    import os as _os
+
+    from main import main
+
+    three_songs = SONGS[:3]
+    track_ids = [{"id": s["id"]} for s in three_songs]
+    respx_mock.get(PLAYLIST_URL).mock(
+        return_value=httpx.Response(
+            200, json={"code": 200, "playlist": {"trackIds": track_ids, "name": "歌单1"}}
+        )
+    )
+    respx_mock.post(SONG_DETAIL_URL).mock(
+        return_value=httpx.Response(200, json={"code": 200, "songs": three_songs})
+    )
+    _mock_bili_env(respx_mock)
+    # 误回 matcher 会发搜索 → 计数断言为 0
+    search_calls = {"n": 0}
+
+    def search_handler(request: httpx.Request) -> httpx.Response:
+        search_calls["n"] += 1
+        kw = request.url.params.get("keyword")
+        return _ok(result=[_video("BV1never", _kw_title(kw))])
+
+    respx_mock.get(SEARCH_URL).mock(side_effect=search_handler)
+
+    # 已有同名夹 "歌单1 (1)" → 复用 media_id，不为续收藏重复建夹
+    _mock_fav_folders(respx_mock, existing=[{"id": 777, "title": "歌单1 (1)"}])
+
+    deal_calls = {"n": 0}
+
+    def deal_handler(request: httpx.Request) -> httpx.Response:
+        deal_calls["n"] += 1
+        return httpx.Response(200, json={"code": 0})
+
+    respx_mock.post(FAV_RESOURCE_URL).mock(side_effect=deal_handler)
+
+    # 预置中断现场：歌1 已收藏（DONE）、歌2 中断时 MATCHED（已匹配未收藏）、
+    # 歌3 FAV_FAILED（收藏失败待重试）；任务保持 RUNNING
+    db = Database(tmp_path / "cache.db")
+    tid = db.create_task(123)
+    db.upsert_song("歌1|艺1", task_id=tid, ncm_id=1, name="歌1", artist="艺1",
+                   status="DONE", method="SCORED", bvid="BV1done")
+    db.upsert_song("歌2|艺2", task_id=tid, ncm_id=2, name="歌2", artist="艺2",
+                   status="MATCHED", method="SCORED", bvid="BV2match")
+    db.upsert_song("歌3|艺3", task_id=tid, ncm_id=3, name="歌3", artist="艺3",
+                   status="FAV_FAILED", method="SCORED", bvid="BV3fail",
+                   fail_reason="收藏失败（code -403）")
+    db.close()
+
+    monkeypatch.setattr("main._load_cookie", lambda: COOKIE)
+
+    old_cwd = _os.getcwd()
+    _os.chdir(tmp_path)
+    try:
+        main(["task", "resume", tid, "--yes"])
+    finally:
+        _os.chdir(old_cwd)
+
+    # 三首都不回 matcher（DONE/MATCHED/FAV_FAILED 均在阶段二跳过集合内）
+    assert search_calls["n"] == 0
+    # deal 次数 = 未完成数（MATCHED 1 + FAV_FAILED 1；DONE 不重复 deal）
+    assert deal_calls["n"] == 2
+    # 全部转 DONE，任务置 DONE（阶段三完成后）
+    db = Database(tmp_path / "cache.db")
+    try:
+        statuses = {
+            r["song_key"]: r["status"] for r in db.query(
+                "SELECT song_key, status FROM songs WHERE task_id = ?", (tid,)
+            )
+        }
+        assert statuses == {"歌1|艺1": "DONE", "歌2|艺2": "DONE", "歌3|艺3": "DONE"}
+        assert db.get_task(tid)["status"] == "DONE"
+    finally:
+        db.close()
 
 
 # ---- CLI 日志初始化（文档 §12：--debug + 脱敏 Filter 挂载）-------------

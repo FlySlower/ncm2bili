@@ -281,3 +281,66 @@ def test_migrate_legacy_songs_table(tmp_path) -> None:
         assert row["bvid"] == "BV1legacy"
     finally:
         db.close()
+
+
+def test_migrate_done_to_matched_v044(tmp_path) -> None:
+    """F2-1（§4.4 迁移策略）：老库（v0.4.2 语义，全 DONE=已匹配）打开后自动转
+    MATCHED（已匹配待收藏），交阶段三 deal 补收藏——deal 幂等，宁可重复收藏
+    也不漏收藏；kv_meta 打标记防重复迁移，迁移后新写入的 DONE（fav_one 收藏
+    成功）不被二次翻转。"""
+    import sqlite3
+
+    path = tmp_path / "legacy044.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE songs (
+          song_key TEXT, task_id TEXT, ncm_id INTEGER, name TEXT, artist TEXT,
+          album TEXT, alia TEXT, origin TEXT, status TEXT, method TEXT,
+          bvid TEXT, score_detail TEXT, fail_reason TEXT, updated_at INTEGER,
+          PRIMARY KEY (song_key, task_id)
+        );
+        CREATE TABLE tasks (
+          task_id TEXT PRIMARY KEY, playlist_id TEXT, status TEXT,
+          created_at INTEGER, finished_at INTEGER, stats TEXT
+        );
+        INSERT INTO tasks (task_id, playlist_id, status, created_at)
+        VALUES ('t-legacy', '123', 'DONE', 1);
+        INSERT INTO songs (song_key, task_id, name, artist, status, method, bvid, updated_at)
+        VALUES
+          ('歌1|艺1', 't-legacy', '歌1', '艺1', 'DONE', 'SCORED', 'BV1old', 1),
+          ('歌2|艺2', 't-legacy', '歌2', '艺2', 'DONE', 'MANUAL', 'BV2old', 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    try:
+        # 打开即迁移：全 DONE → MATCHED，且写入一次性标记
+        rows = db.query(
+            "SELECT song_key, status FROM songs WHERE task_id = 't-legacy' ORDER BY song_key"
+        )
+        assert [(r["song_key"], r["status"]) for r in rows] == [
+            ("歌1|艺1", "MATCHED"),
+            ("歌2|艺2", "MATCHED"),
+        ]
+        assert db.query_one(
+            "SELECT value FROM kv_meta WHERE key = 'migrated_done_to_matched_v044'"
+        ) is not None
+
+        # 迁移后 fav_one 收藏成功写 DONE（新语义的终态）
+        db.upsert_song("歌1|艺1", task_id="t-legacy", status="DONE",
+                       method="SCORED", bvid="BV1old")
+    finally:
+        db.close()
+
+    # 再次打开：标记已存在，不二次迁移——DONE 保持 DONE（否则收藏永远无法收敛）
+    db = Database(path)
+    try:
+        row = db.query_one(
+            "SELECT status FROM songs WHERE song_key = '歌1|艺1' AND task_id = 't-legacy'"
+        )
+        assert row["status"] == "DONE"
+    finally:
+        db.close()

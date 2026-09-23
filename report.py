@@ -2,6 +2,8 @@
 
 preview_report.html 逐首展示 song_key、最终 BV、method、评分明细（score_detail
 展开为候选对比列表）；report.csv 为结构化数据（utf-8-sig 兼容 Excel）。
+F2-1（§4.1）：摘要行展示 status 计数（DONE/MATCHED/MANUAL/FAV_FAILED），
+正式运行下 MATCHED=已匹配待收藏、DONE=已收藏。
 """
 from __future__ import annotations
 
@@ -24,6 +26,14 @@ _METHOD_LABEL = {
     "UPLOADER_WL": "UP主白名单",
     "SCORED": "评分",
     "MANUAL": "人工",
+}
+# F2-1（§4.1）：状态计数展示，与 songs.status 枚举一致
+_STATUS_LABEL = {
+    "PENDING": "待匹配",
+    "MATCHED": "已匹配待收藏",
+    "DONE": "已收藏",
+    "MANUAL": "人工",
+    "FAV_FAILED": "收藏失败",
 }
 
 _HTML_TPL = """<!DOCTYPE html>
@@ -50,7 +60,7 @@ th {{ background: #f5f5f5; }}
 </head>
 <body>
 <h1>ncm2bili 预览报告（dry-run）</h1>
-<div class="summary">生成时间：{generated} ｜ 共 {total} 首 ｜ {method_summary}</div>
+<div class="summary">生成时间：{generated} ｜ 共 {total} 首 ｜ {status_summary} ｜ {method_summary}</div>
 <table>
 <thead>
 <tr><th>#</th><th>song_key</th><th>歌曲</th><th>歌手</th><th>method</th>
@@ -131,10 +141,13 @@ def write_preview_html(rows: list[dict], path: str | Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     method_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
     body_parts: list[str] = []
     for idx, row in enumerate(rows, 1):
         method = row["method"] or "MANUAL"
         method_counts[method] = method_counts.get(method, 0) + 1
+        status = row["status"] or "PENDING"
+        status_counts[status] = status_counts.get(status, 0) + 1
         body_parts.append(
             _ROW_TPL.format(
                 idx=idx,
@@ -148,12 +161,16 @@ def write_preview_html(rows: list[dict], path: str | Path) -> Path:
                 fail_reason=html.escape(row["fail_reason"] or ""),
             )
         )
+    status_summary = " ｜ ".join(
+        f"{_STATUS_LABEL.get(s, s)} {n} 首" for s, n in sorted(status_counts.items())
+    )
     method_summary = " ｜ ".join(
         f"{_METHOD_LABEL.get(m, m)} {n} 首" for m, n in sorted(method_counts.items())
     )
     page = _HTML_TPL.format(
         generated=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         total=len(rows),
+        status_summary=html.escape(status_summary),
         method_summary=html.escape(method_summary),
         rows="\n".join(body_parts),
     )

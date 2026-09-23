@@ -12,6 +12,9 @@
 - 置信度准入 MatchGate（§4.2）：NO_TITLE_MATCH（含短歌名联合闸）→
   min_score → min_margin 三闸门，每轮内嵌判定，不达标继续降级轮，耗尽置
   MANUAL 并记对应 fail_reason；config.yaml match 段驱动，无硬编码；
+- 匹配成功统一落点 MATCHED（§4.1，F2-1）：_finish() 写 MATCHED（已匹配待
+  收藏），仅 fav_one() 收藏成功才写 DONE；dry_run=True 时无阶段三，匹配
+  完成直接置 DONE（§10.1 例外）；
 - search_cache 缓存正确性（§4.4）：key 为完整 sanitize 后关键词；读写各
   json 序列化/解析保证对象隔离；空结果不缓存、不回退复用其他关键词结果；
   结果归属校验（标题须含歌名 token）拦截上游 stale 结果写入缓存；
@@ -142,6 +145,8 @@ class Matcher:
         uploaders: {"mid": {"name": ..., "note": ...}}。
         blacklist_words: 黑名单词列表。
         manual: {"歌名|歌手": "BV号"}；提供时同步进 whitelist_bv 表（source=manual）。
+        dry_run: 文档 §10.1（F2-1）：True 时无阶段三，匹配完成直接置 DONE；
+                 False（默认，正式语义）时匹配成功置 MATCHED，交阶段三收藏。
     """
 
     def __init__(
@@ -157,6 +162,7 @@ class Matcher:
         uploaders: dict | None = None,
         blacklist_words: list[str] | None = None,
         manual: dict | None = None,
+        dry_run: bool = False,
     ) -> None:
         self._config = config
         self._db = db
@@ -164,6 +170,7 @@ class Matcher:
         self._ncm = ncm_client
         self._http = http_client
         self._task_id = task_id
+        self._dry_run = dry_run
         # 文档 §6：whitelist_bv 表为优先级统一入口，内存 dict 移除。
         # 传入的 whitelist/manual 同步进表，运行时仅从表读取。
         for key, bvid in (whitelist or {}).items():
@@ -229,8 +236,9 @@ class Matcher:
     async def match_song(self, song: dict) -> dict:
         """对一首歌走完整状态机，返回最终结果。
 
-        起始先落盘 PENDING（含元数据），成功 DONE、失败 MANUAL——
-        任何时刻中断后重启，从 db 读到的状态即可断点续跑（文档 §4.4）。
+        起始先落盘 PENDING（含元数据），成功 MATCHED（dry-run 为 DONE，§10.1）、
+        失败 MANUAL——任何时刻中断后重启，从 db 读到的状态即可断点续跑
+        （文档 §4.4）。
         """
         key = self.song_key(song)
         self._db.upsert_song(
@@ -504,10 +512,15 @@ class Matcher:
         bvid: str,
         score_detail: dict | None = None,
     ) -> dict:
+        """匹配成功统一落点（文档 §4.1，F2-1）：正式语义写 MATCHED（已匹配待
+        收藏），仅 fav_one() 收藏成功才写 DONE；dry-run 无阶段三，直接置 DONE
+        （§10.1 例外）。method 语义不变。fail_reason 显式置 NULL（成功与失败
+        原因互斥，§6 状态跃迁约束；覆盖此前 MANUAL 残留的失败原因）。"""
+        status = "DONE" if self._dry_run else "MATCHED"
         self._db.upsert_song(
             key,
             task_id=self._task_id,
-            status="DONE",
+            status=status,
             method=method,
             bvid=bvid,
             score_detail=json.dumps(score_detail, ensure_ascii=False) if score_detail else None,
@@ -515,7 +528,7 @@ class Matcher:
         )
         return {
             "song_key": key,
-            "status": "DONE",
+            "status": status,
             "method": method,
             "bvid": bvid,
             "score_detail": score_detail,

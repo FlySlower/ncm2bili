@@ -4,7 +4,9 @@
       生成 output/preview_report.html + report.csv。
 --dry-run 不调用任何收藏夹创建/收藏接口（文档 §10.1）。
 
-中断后可重跑：songs 表中已 DONE 的歌直接跳过，不再发搜索请求（§4.4 断点续跑）。
+中断后可重跑：songs 表中已 DONE / MATCHED / FAV_FAILED 的歌直接跳过，
+不再发搜索请求（文档 §4.4 resume 语义，F2-1）。正式运行匹配成功置
+MATCHED（已匹配待收藏，§4.1），阶段三 fav_one() 成功才逐个置 DONE。
 """
 from __future__ import annotations
 
@@ -71,8 +73,9 @@ async def run_dry_run(
     manual: dict | None = None,
     refresh: bool = False,
     task_id: str | None = None,
+    dry_run: bool = True,
 ) -> dict:
-    """dry-run 主流程（可编程入口，测试直接注入 clients）。
+    """匹配主流程（阶段一 + 阶段二，可编程入口，测试直接注入 clients）。
 
     Args:
         playlist_id: 网易云歌单 ID。
@@ -81,6 +84,10 @@ async def run_dry_run(
         refresh: 文档 §4.4 --refresh 语义：丢弃当前任务匹配结果（重置 songs 状态），
                  保留 search_cache 与歌单数据；True 时全部歌曲重新匹配。
         task_id: 指定任务（resume 复用现有任务）；None 时创建新 RUNNING 任务（文档 §4.4）。
+        dry_run: 文档 §10.1（F2-1）：True（dry-run）无阶段三，匹配完成直接置 DONE，
+                 阶段二完成即任务置 DONE；False（正式运行的匹配段）匹配成功置
+                 MATCHED（已匹配待收藏，§4.1），任务保持 RUNNING——DONE 时机移到
+                 阶段三完成后，由 run_formal / resume 置 DONE。
     """
     if whitelist is None:
         whitelist = _load_json("whitelist.json", {})
@@ -105,20 +112,24 @@ async def run_dry_run(
             (task_id,),
         )
 
-    # 文档 §4.1 优先级重查：已 DONE 的歌若 manual.json 新增了对应 BV 且与现有不同，
-    # 升级为人工结果（method=MANUAL）；不发任何网络请求。
+    # 文档 §4.1 优先级重查（F2-1）：已 DONE 的歌若 manual.json 新增了对应 BV 且
+    # 与现有不同，升级为人工结果交阶段三收藏新 BV——正式运行置 MATCHED（已匹
+    # 配待收藏）；dry-run 无阶段三，保持 DONE（仅更新 bvid/method）。不发任何
+    # 网络请求。
     if manual:
         rows = db.query(
             "SELECT song_key, bvid FROM songs WHERE status = 'DONE' AND task_id = ?",
             (task_id,),
         )
+        upgraded_status = "DONE" if dry_run else "MATCHED"
         for row in rows:
             key = row["song_key"]
             manual_bv = manual.get(key)
             if manual_bv and manual_bv != row["bvid"]:
                 db.upsert_song(
-                    key, task_id=task_id, status="DONE", method="MANUAL", bvid=manual_bv,
-                    fail_reason=None,  # 转 DONE 清因（文档 §6 状态跃迁约束）
+                    key, task_id=task_id, status=upgraded_status, method="MANUAL",
+                    bvid=manual_bv,
+                    fail_reason=None,  # 成功态清因（文档 §6 状态跃迁约束）
                 )
 
     # 阶段一：网易云抓取（文档 §5.1）
@@ -136,17 +147,19 @@ async def run_dry_run(
         uploaders=uploaders,
         blacklist_words=blacklist_words,
         manual=manual,
+        dry_run=dry_run,  # 文档 §10.1（F2-1）：dry-run 匹配完成直接 DONE，否则 MATCHED
     )
 
-    # 阶段二：跳过已 DONE / FAV_FAILED 的歌（断点续跑 §4.4，按 task_id 隔离）。
-    # FAV_FAILED 已完成匹配（bvid 已存），resume 只重跑阶段三收藏，不回 matcher。
+    # 阶段二：跳过已完成匹配/收藏的歌（断点续跑 §4.4，按 task_id 隔离）。
+    # F2-1 新语义：MATCHED 已匹配待收藏、FAV_FAILED 已匹配收藏失败（bvid 已存），
+    # 两者 resume 时都不回 matcher/搜索，只交阶段三收藏（run_formal / task resume）。
     pending: list[dict] = []
     for song in songs:
         key = Matcher.song_key(song)
         row = db.query_one(
             "SELECT status FROM songs WHERE song_key = ? AND task_id = ?", (key, task_id)
         )
-        if row is not None and row["status"] in ("DONE", "FAV_FAILED"):
+        if row is not None and row["status"] in ("DONE", "MATCHED", "FAV_FAILED"):
             continue
         pending.append(song)
 
@@ -172,12 +185,22 @@ async def run_dry_run(
         raise
 
     done = sum(1 for r in results if r["status"] == "DONE")
+    matched = sum(1 for r in results if r["status"] == "MATCHED")
     manual = sum(1 for r in results if r["status"] == "MANUAL")
-    db.update_task(
-        task_id,
-        status="DONE",
-        stats={"total": len(songs), "done": done, "manual": manual},
-    )
+    stats = {
+        "total": len(songs),
+        "done": done,
+        "matched": matched,
+        "manual": manual,
+    }
+    if dry_run:
+        # 文档 §10.1（F2-1）：dry-run 无阶段三，阶段二完成即任务 DONE
+        db.update_task(task_id, status="DONE", stats=stats)
+    else:
+        # 文档 §4.1/§4.4（F2-1）：正式运行 DONE 时机移到阶段三完成后
+        # （run_formal / task resume 收尾时置 DONE）；此处仅写进度统计，
+        # 阶段三失败退出时任务保持 RUNNING，可被 task resume 恢复
+        db.update_task(task_id, stats=stats)
 
     # 生成报告（dry-run 不建收藏夹、不收藏，见文档 §10.1）
     # 文档 §3 阶段三"报告（绑定 task_id）"：仅报告当前任务的歌曲
@@ -194,6 +217,28 @@ async def run_dry_run(
         "methods": methods,
         "reports": [str(csv_path), str(html_path)],
         "playlist_name": await ncm.fetch_playlist_name(playlist_id),
+    }
+
+
+def _final_task_stats(db: Database, task_id: str) -> dict:
+    """从 songs 表汇总任务最终 stats（阶段三完成后置 DONE 用，文档 §4.4/F2-1）。"""
+    row = db.query_one(
+        """
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN status = 'DONE' THEN 1 ELSE 0 END) AS done_songs,
+               SUM(CASE WHEN status = 'MATCHED' THEN 1 ELSE 0 END) AS matched_songs,
+               SUM(CASE WHEN status = 'MANUAL' THEN 1 ELSE 0 END) AS manual_songs,
+               SUM(CASE WHEN status = 'FAV_FAILED' THEN 1 ELSE 0 END) AS fav_failed_songs
+        FROM songs WHERE task_id = ?
+        """,
+        (task_id,),
+    )
+    return {
+        "total": row["total"] or 0,
+        "done": row["done_songs"] or 0,
+        "matched": row["matched_songs"] or 0,
+        "manual": row["manual_songs"] or 0,
+        "fav_failed": row["fav_failed_songs"] or 0,
     }
 
 
@@ -217,10 +262,14 @@ async def run_formal(
 ) -> dict:
     """正式运行：dry-run 全流程（阶段一/二）+ 阶段三批量收藏（文档 §5.3/§9.3）。
 
-    阶段三要点：
+    阶段三要点（F2-1）：
+    - 阶段二匹配成功置 MATCHED（已匹配待收藏，§4.1），阶段三从 db 读取
+      status='MATCHED' 且有 bvid 的歌曲进入收藏；
     - 按 900/夹拆分、复用已有同名夹 media_id（§5.3）；
     - 幂等三分支：已收藏→DONE、视频失效→MANUAL、其他失败→FAV_FAILED（§9.3）；
     - -101/-111 立即中止并提示重新 auth（§9.2）；建夹失败 -400 停止保留断点；
+    - 任务置 DONE 的时机移到阶段三完成后（§4.4）：失败退出时任务保持 RUNNING，
+      可被 task resume 恢复（MATCHED 续收藏、FAV_FAILED 重试收藏）；
     - session_headers: 阶段一启动时选定的 UA/Referer（§7 身份层），收藏客户端沿用。
     """
     counts = await run_dry_run(
@@ -237,12 +286,14 @@ async def run_formal(
         manual=manual,
         refresh=refresh,
         task_id=task_id,
+        dry_run=False,  # 文档 §4.1（F2-1）：正式运行匹配成功置 MATCHED，非 DONE
     )
     task_id = counts["task_id"]
 
-    # 阶段三：从 db 读取匹配成功（DONE 且有 bvid）的歌曲进入收藏（按 task 作用域）
+    # 阶段三：从 db 读取匹配成功（MATCHED 且有 bvid）的歌曲进入收藏（按 task 作用域，
+    # 文档 §4.1/F2-1 新语义；fav_one() 收藏成功才逐个置 DONE，§9.3）
     rows = db.query(
-        "SELECT * FROM songs WHERE status = 'DONE' AND bvid IS NOT NULL AND task_id = ?",
+        "SELECT * FROM songs WHERE status = 'MATCHED' AND bvid IS NOT NULL AND task_id = ?",
         (task_id,),
     )
     fav_songs_list = [dict(r) for r in rows]
@@ -264,9 +315,13 @@ async def run_formal(
     except AuthExpiredError:
         raise  # 文档 §9.2：凭证失效有明确语义（提示重新 auth），不被兜底吞掉
     except Exception as exc:  # noqa: BLE001 - 兜底：不允许裸 traceback 给用户
-        # 文档 §5.3：建夹失败/未预期异常 → 记录 ERROR、保留断点、非零码退出
-        logger.error("阶段三收藏失败（断点已保留，修复后重跑可直接续跑）: %s", exc, exc_info=True)
+        # 文档 §5.3：建夹失败/未预期异常 → 记录 ERROR、保留断点（任务保持 RUNNING）、
+        # 非零码退出；task resume 可续跑（MATCHED/FAV_FAILED 续收藏，§4.4）
+        logger.error("阶段三收藏失败（断点已保留，修复后 task resume 可续跑）: %s", exc, exc_info=True)
         raise SystemExit(1) from exc
+
+    # 文档 §4.4（F2-1）：阶段三完成后任务置 DONE（此前保持 RUNNING）
+    db.update_task(task_id, status="DONE", stats=_final_task_stats(db, task_id))
     counts["fav"] = summary
     return counts
 
@@ -388,7 +443,7 @@ def _run_command(args: argparse.Namespace) -> None:
         print(f"任务 {counts['task_id']} 完成")
         print(
             f"共 {counts['total']} 首，处理 {counts['processed']} 首，"
-            f"跳过 {counts['skipped_done']} 首（已 DONE）"
+            f"跳过 {counts['skipped_done']} 首（已 DONE/MATCHED/FAV_FAILED）"
         )
         print("method 分布:", counts["methods"])
         print("收藏结果:", counts["fav"])
@@ -403,12 +458,18 @@ def _print_task_summary(row, index: int | None = None) -> None:
     import datetime as _dt
 
     created = _dt.datetime.fromtimestamp(row["created_at"]).strftime("%Y-%m-%d %H:%M")
-    stats = (row["total_songs"], row["done_songs"] or 0, row["manual_songs"] or 0)
+    stats = (
+        row["total_songs"],
+        row["done_songs"] or 0,
+        row["manual_songs"] or 0,
+        row["matched_songs"] or 0,
+    )
     fav_failed = row["fav_failed_songs"] or 0
     prefix = f"[{index}] " if index is not None else ""
     print(
         f"{prefix}task={row['task_id']} 歌单={row['playlist_id']} 状态={row['status']} "
-        f"DONE{stats[1]}/MANUAL{stats[2]}/FAV_FAILED{fav_failed}/总数{stats[0]} 创建于 {created}"
+        f"DONE{stats[1]}/MATCHED{stats[3]}/MANUAL{stats[2]}/FAV_FAILED{fav_failed}"
+        f"/总数{stats[0]} 创建于 {created}"
     )
 
 
@@ -456,6 +517,7 @@ def _task_delete_command(args: argparse.Namespace) -> None:
             SELECT t.task_id, t.playlist_id, t.status, t.created_at,
                    COUNT(s.song_key) AS total_songs,
                    SUM(CASE WHEN s.status = 'DONE' THEN 1 ELSE 0 END) AS done_songs,
+                   SUM(CASE WHEN s.status = 'MATCHED' THEN 1 ELSE 0 END) AS matched_songs,
                    SUM(CASE WHEN s.status = 'MANUAL' THEN 1 ELSE 0 END) AS manual_songs,
                    SUM(CASE WHEN s.status = 'FAV_FAILED' THEN 1 ELSE 0 END) AS fav_failed_songs
             FROM tasks t LEFT JOIN songs s ON s.task_id = t.task_id
@@ -491,6 +553,7 @@ def _task_resume_command(args: argparse.Namespace) -> None:
         SELECT t.task_id, t.playlist_id, t.status, t.created_at,
                COUNT(s.song_key) AS total_songs,
                SUM(CASE WHEN s.status = 'DONE' THEN 1 ELSE 0 END) AS done_songs,
+               SUM(CASE WHEN s.status = 'MATCHED' THEN 1 ELSE 0 END) AS matched_songs,
                SUM(CASE WHEN s.status = 'MANUAL' THEN 1 ELSE 0 END) AS manual_songs,
                SUM(CASE WHEN s.status = 'FAV_FAILED' THEN 1 ELSE 0 END) AS fav_failed_songs
         FROM tasks t LEFT JOIN songs s ON s.task_id = t.task_id
@@ -500,7 +563,8 @@ def _task_resume_command(args: argparse.Namespace) -> None:
     )
     _print_task_summary(summary)
     if not _confirm(
-        f"resume 任务 {args.task_id}（已 DONE 不重复匹配，仅处理未完成歌曲）?", args.yes
+        f"resume 任务 {args.task_id}（已 DONE/MATCHED 不重复匹配，"
+        f"MATCHED/FAV_FAILED 仅重跑阶段三收藏）?", args.yes
     ):
         db.close()
         print("已取消")
@@ -538,48 +602,57 @@ def _task_resume_command(args: argparse.Namespace) -> None:
             http,
             output_dir=_DEFAULT_OUTPUT_DIR,
             task_id=args.task_id,
+            dry_run=False,  # 文档 §4.1（F2-1）：resume 走正式语义（匹配成功置 MATCHED）
         )
         print(f"任务 {counts['task_id']} 恢复完成")
         print(
             f"共 {counts['total']} 首，处理 {counts['processed']} 首，"
-            f"跳过 {counts['skipped_done']} 首（已 DONE）"
+            f"跳过 {counts['skipped_done']} 首（已 DONE/MATCHED/FAV_FAILED）"
         )
         print("method 分布:", counts["methods"])
         for path in counts["reports"]:
             print(f"报告已生成: {path}")
 
-        # 文档 §4.4：FAV_FAILED 歌已匹配完成（bvid 已存），resume 只重跑
-        # 阶段三收藏，不再回 matcher/搜索；收藏夹按 §5.3 名称复用，不为重试重复建夹。
+        # 文档 §4.4（F2-1）：阶段三对 MATCHED（首次收藏）与 FAV_FAILED（重试收藏）
+        # 执行 deal，成功即逐首置 DONE（fav.py）。两者均已匹配完成（bvid 已存），
+        # 不回 matcher/搜索；已收藏的歌（DONE）不在查询内，不会重复 deal；
+        # 收藏夹按 §5.3 名称复用，不为重试重复建夹。
         retry_rows = db.query(
-            "SELECT * FROM songs WHERE status = 'FAV_FAILED' AND bvid IS NOT NULL AND task_id = ?",
+            "SELECT * FROM songs WHERE status IN ('MATCHED', 'FAV_FAILED') "
+            "AND bvid IS NOT NULL AND task_id = ?",
             (args.task_id,),
         )
-        if not retry_rows:
-            return
+        if retry_rows:
+            from fav import AuthExpiredError, BiliFavClient, fav_songs
 
-        from fav import AuthExpiredError, BiliFavClient, fav_songs
+            cookie_str = _load_cookie()
+            fav_client = BiliFavClient(
+                http,
+                db,
+                config,
+                cookie_str,
+                user_agent=session_headers.get("User-Agent"),  # §7 身份层同 session UA
+                breaker=CircuitBreaker(config.risk_control.circuit_breaker),  # §7 响应层 b
+            )
+            try:
+                summary = await fav_songs(
+                    fav_client, db, config, [dict(r) for r in retry_rows],
+                    counts["playlist_name"],
+                )
+            except AuthExpiredError:
+                raise  # 文档 §9.2：凭证失效提示重新 auth，不被兜底吞掉
+            except Exception as exc:  # noqa: BLE001 - 兜底保留断点（任务保持 RUNNING），允许再次 resume
+                logger.error(
+                    "阶段三收藏失败（断点已保留，修复后可再次 resume）: %s", exc, exc_info=True
+                )
+                raise SystemExit(1) from exc
+            print(f"收藏（MATCHED/FAV_FAILED 共 {len(retry_rows)} 首）结果: {summary}")
 
-        cookie_str = _load_cookie()
-        fav_client = BiliFavClient(
-            http,
-            db,
-            config,
-            cookie_str,
-            user_agent=session_headers.get("User-Agent"),  # §7 身份层同 session UA
-            breaker=CircuitBreaker(config.risk_control.circuit_breaker),  # §7 响应层 b
+        # 文档 §4.4（F2-1）：阶段三完成后任务置 DONE；无可收藏歌时阶段三视为
+        # 已完成（此前 run_dry_run 已把任务置 RUNNING）
+        db.update_task(
+            args.task_id, status="DONE", stats=_final_task_stats(db, args.task_id)
         )
-        try:
-            summary = await fav_songs(
-                fav_client, db, config, [dict(r) for r in retry_rows], counts["playlist_name"]
-            )
-        except AuthExpiredError:
-            raise  # 文档 §9.2：凭证失效提示重新 auth，不被兜底吞掉
-        except Exception as exc:  # noqa: BLE001 - 兜底保留断点，允许再次 resume
-            logger.error(
-                "阶段三收藏重试失败（断点已保留，修复后可再次 resume）: %s", exc, exc_info=True
-            )
-            raise SystemExit(1) from exc
-        print(f"收藏重试（FAV_FAILED {len(retry_rows)} 首）结果: {summary}")
 
     try:
         asyncio.run(_main())
