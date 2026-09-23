@@ -2,8 +2,8 @@
 
 | 项目 | 内容 |
 | :--- | :--- |
-| **版本** | v0.4（v0.1 + v0.2 合并修订版） |
-| **日期** | 2026-09-22 |
+| **版本** | v0.4.3 |
+| **日期** | 2026-09-23 |
 | **技术栈** | Python 3.11+ / httpx / asyncio / SQLite / Pydantic / playwright(仅 auth) |
 | **目标规模** | 单歌单最大 3000 首，全程 ≤ 20 分钟 |
 
@@ -96,13 +96,35 @@
 | 搜索重试耗尽单歌降级：BiliError 由 matcher 捕获置 MANUAL（fail_reason=SEARCH_FAILED），任务不中断；重试必须重新生成 wts/w_rid；BiliError 消息携带根因 | 修复 | §9.1/§5.2；实测 16:12 单点失败崩整个任务 |
 | MatchGate 增补第三闸门 NO_TITLE_MATCH（标题须含歌名 token）与短歌名联合闸（歌名 ≤2 字时标题还须含艺人 token），阈值默认 min_score=16 / min_margin=2 | 功能 | §4.2；实测三批次（62/25/130 首）驱动 |
 
-### v0.4.1 → v0.4.2 变更（起草）
+### v0.4.1 → v0.4.2 变更
 
 | 变更 | 类型 | 说明 |
 | :--- | :--- | :--- |
 | 修复 fail_reason 残留：状态转 DONE 时未清空历史失败原因，导致报告导出误读（实测：DONE/UPLOADER_WL 行残留"降级链全部未命中"） | 修复 | §6/§10.1 |
 | 移除废弃的音乐百科 wiki 方法（ncm.py）及测试中 WIKI_URL mock 残留 | 清理 | §5.1/§3.1；降级链早已不再调用，残留曾导致测试维护事故 |
 | 澄清 fail_reason 残留：核验四条 DONE 写库路径均显式置空（_finish 汇聚点 + db.py 中央强制），新增四路径单测锁定；report 观感残留源于默认导出全任务的历史数据 | 澄清 | §6/§10.1 |
+
+### v0.4.2 → v0.4.3 变更（2026-09-23，两轮代码审查修订）
+
+| 变更 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| 新增 MATCHED（已匹配待收藏）中间态：matcher._finish() 写 MATCHED，fav_one() 收藏成功写 DONE；任务在阶段三完成前不得置 DONE（dry-run 无阶段三，匹配完成即 DONE） | **架构级** | §3/§4.1/§6/§9.3/§10.1 |
+| resume 语义改写：补齐未完成匹配 + 执行/重试收藏（MATCHED 与 FAV_FAILED），不再限于 FAV_FAILED 重试；阶段二跳过 DONE/MATCHED/FAV_FAILED | 功能 | §4.4/§9.3/§10.1/§11.4/§13.2 |
+| 收藏夹分配明确为按序连续分段（第 1~900 首进夹 1、901~1800 进夹 2……），禁止任何交错/轮转分配；resume 建夹数量按任务总匹配数计算，保证歌进原夹 | 修正 | §5.3 |
+| 搜索间隔明确作用于每一次搜索请求（含降级链每一轮）：sleep = interval_ms + uniform(jitter)，不是每首歌一次 | 修正 | §7 预防层 |
+| 响应层 a 澄清：重试上限 3 次指重试次数（初次 + 3 次重试 = 共 4 次尝试，退避 2s→4s→8s），搜索与收藏统一 | 澄清 | §7 响应层 a |
+| MatchGate 不采纳时 bvid 显式置空落库（禁止沿用历史值），与 fail_reason 同属清空类字段 | 修复 | §4.2 |
+| 搜索结果归属校验改为逐条校验：仅保留标题含全部歌名 token 的候选，过滤后为空视为未命中 | 修复 | §4.4 |
+| UPLOADER_WL 命中判断改为归一化对归一化：`_normalize(name) in _normalize(title)` | 修复 | §4.1 ④ |
+| 脱敏铁律扩充至异常堆栈：Filter 需覆盖 exc_info | 补充 | §9.4/§12 |
+| review_server 写入侧增加一次性 token + Origin 校验 + song_key 长度上限；review.html 改用 data-* 属性传参，废除 onclick 字符串拼接 | 安全 | §10.3 |
+| 补 schema 迁移策略：老库 DONE 全量转 MATCHED（deal 幂等，宁可重复收藏）；songs_legacy → 'legacy' 任务既有迁移写入文档 | 补充 | §4.4/§6 |
+| §8 收藏阶段请求量 = N（deal）+ M（view，仅 aid 缓存 miss 时）；§5.2 补 `/x/v3/fav/folder/created/list-all`（up_mid 必填）与 nav 兜底取 mid | 补充 | §5.2/§8 |
+| §11.1 如实描述依赖：asyncio.gather + PyYAML（原文误写 TaskGroup 与 tomllib） | 修正 | §11.1 |
+| whitelist_bv 全量同步语义：json 删除的条目在表中同步删除 | 补充 | §4.4/§6 |
+| §11.4 所有数据文件路径基于项目根（`Path(__file__).resolve().parent`），CWD 无关 | 补充 | §11.4 |
+| 新增 §15 决策记录（4 项待确认）：MATCHED 落地形态 / 降并发 50% 生效机制 / stage2 限速 / http.timeout_s 与 wbi_keys_ttl_s 接线 | 决策 | §7/§15 |
+| §13.2 收藏链路测试对齐 MATCHED 语义 | 测试 | §13.2 |
 
 ---
 
@@ -162,18 +184,21 @@
 │   每首歌的状态机闯关（所有状态/结果绑定 task_id）：              │
 │   WHITELIST_BV ─► SEARCH ─► BLACKLIST ─► UPLOADER_WL        │
 │   ─► SCORING(两阶段) ─► RETRY(降级关键词) ─► MANUAL          │
+│   匹配成功一律置 MATCHED（已匹配待收藏，§4.1）；正式运行        │
+│   阶段三完成前不得置 DONE；dry-run 无阶段三，匹配完成即 DONE    │
 └─────────────────────────────────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
 │ 阶段三：批量收藏（B站，并发 1 保守默认，可调）【task 作用域】         │
-│   自动建收藏夹（每 900 首一个，见§5.3留余量策略）──► 逐条 deal ──► 报告（绑定 task_id） │
+│   自动建收藏夹（每 900 首一个，见§5.3留余量策略）──► 逐条 deal，   │
+│   fav_one() 收藏成功逐条置 DONE ──► 报告（绑定 task_id）        │
 │   （--dry-run 时跳过本阶段，改为 preview_report.html）         │
 └─────────────────────────────────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
 │ 阶段四：人工回灌                                               │
 │   review.html ──► 页面内填 BV 保存（本地服务）──► manual.json  │
-│   ──► 重跑（manual 优先级最高）──► DONE                        │
+│   ──► 重跑（manual 优先级最高）──► MATCHED ──► 阶段三 ──► DONE  │
 └─────────────────────────────────────────────────────────────┘
 
 横切：SQLite（缓存+状态机）│ 任务管理（§4.4）│ 分层风控（§7）│ 结构化日志（§12）│ 测试（§13）
@@ -218,7 +243,7 @@ ncm2bili/
         ┌──────────────┐
         │   PENDING    │
         └──────┬───────┘
-   ①whitelist.json 精确命中?         是 ──► DONE (method=WHITELIST_BV)
+   ①whitelist.json 精确命中?         是 ──► MATCHED (method=WHITELIST_BV)
                │ 否
                ▼
    ②B站搜索 轮 1 关键词（§4.3："歌名 歌手"）
@@ -227,17 +252,27 @@ ncm2bili/
    ③黑名单过滤（标题归一化后含黑名单词 → 淘汰并记因）
                │
                ▼
-   ④uploaders.json 命中 mid 且标题含歌名?   是 ──► DONE (method=UPLOADER_WL)
+   ④uploaders.json 命中 mid 且 _normalize(歌名) ⊆ _normalize(标题)?
+               │                                   是 ──► MATCHED (method=UPLOADER_WL)
                │ 否
                ▼
-    ⑤两阶段评分 ──► 有合格候选（通过 §4.2 置信度准入）?   是 ──► DONE (method=SCORED)
+    ⑤两阶段评分 ──► 有合格候选（通过 §4.2 置信度准入）?   是 ──► MATCHED (method=SCORED)
                │ 否
                ▼
    ⑥降级关键词重试：按 §4.3 降级链逐轮重试，成功回 ③
                │ 仍失败
                ▼
-           MANUAL（method=MANUAL 待人工）──► review.html 回灌 ──► DONE
+           MANUAL（method=MANUAL 待人工）──► review.html 回灌 ──► 重跑命中 ──► MATCHED
+
+   MATCHED ──► 阶段三 fav_one() 收藏成功 ──► DONE
 ```
+
+**状态跃迁语义（v0.4.3 新增 MATCHED）**：
+
+- **MATCHED（已匹配待收藏）** 是匹配成功的统一落点：`matcher._finish()` 写 MATCHED；仅 `fav_one()`（fav.py）收藏成功才写 DONE。正式运行时，任务在阶段三完成前任何歌曲不得置 DONE；dry-run 例外——无阶段三，`_finish()` 直接置 DONE（§10.1）。
+- 状态枚举：`PENDING / MATCHED / DONE / MANUAL / FAV_FAILED`——§3 架构图、§4.1、§6 DDL 三处一致；MATCHED 落地形态取舍见 §15 决策点 a。
+- resume：阶段二跳过 `DONE / MATCHED / FAV_FAILED`；阶段三对 `MATCHED`（首次收藏）与 `FAV_FAILED`（重试收藏）执行收藏（§4.4）。
+- ④ 命中判断为**归一化对归一化**：`_normalize(name) in _normalize(title)`（v0.4.3 修正：原表述"标题含歌名"为原文子串匹配，大小写/全半角/空白差异会漏判）。
 
 **优先级铁律（全文唯一出处）**：
 
@@ -246,7 +281,7 @@ manual.json（人工） > whitelist.json（精确BV） > uploaders.json（账号
 ```
 
 - 人工回灌结果一旦写入 `manual.json` 并重跑，**永远覆盖**自动结果——这是"人工可介入"设计目标的落点。
-- 状态机每次启动时先做优先级重查：一首歌即使已 DONE，若 `manual.json` 后来新增了对应 BV，重跑时应升级为人工结果。
+- 状态机每次启动时先做优先级重查：一首歌即使已 DONE，若 `manual.json` 后来新增了对应 BV，重跑时应升级为人工结果（置 MATCHED，交阶段三收藏）。
 - 黑名单过滤在账号白名单**之前**执行——白名单免打分，不免内容审查。
 
 ### 4.2 两阶段评分
@@ -278,7 +313,7 @@ score = w1·log10(播放量+1)
 - `top1.score < match.min_score`（低置信）→ MANUAL
 - `top1.score - top2.score < match.min_margin`（头部不分伯仲）→ MANUAL
 
-不采纳时：bvid 置空，`fail_reason` 记 `LOW_CONFIDENCE: top1={s1} top2={s2}`；`score_detail`（含 top3 候选）完整落库，供 review.html 展示与人工裁决。
+不采纳时：**bvid 显式置空落库**（与 `fail_reason` 同属清空类字段——upsert 语义允许显式传 NULL 写入，禁止沿用历史值），`fail_reason` 记 `LOW_CONFIDENCE: top1={s1} top2={s2}`；`score_detail`（含 top3 候选）完整落库，供 review.html 展示与人工裁决。
 
 参数 config 驱动（`config.yaml` 的 `match` 段，默认值以 config.yaml 为准，代码与 docstring 禁止硬编码）。WHITELIST_BV / UPLOADER_WL 路径不经打分，不适用本门槛。MANUAL 语义不变，review/resume 现有路径直接复用。
 
@@ -310,12 +345,19 @@ score = w1·log10(播放量+1)
 ### 4.4 任务与缓存
 
 - **断点数据按任务隔离**：每首歌的状态跃迁落盘至 `songs` 表，新增 `task_id` 列（§6），每个运行周期生成唯一 `task_id`，所有状态、评分、缓存结果均绑定当前任务，互不干扰。
-- **resume 语义**：`python main.py task resume <task_id>` 加载指定任务的断点状态：已 DONE 的歌直接跳过（不重复发请求）；`FAV_FAILED` 的歌只重跑阶段三——直接取已匹配的 bvid 重新 deal，不重进阶段二、不重复搜索请求。
+- **resume 语义（v0.4.3 改写）**：`python main.py task resume <task_id>` = **补齐未完成匹配 + 执行/重试收藏**，两段接力，不再限于 FAV_FAILED 重试：
+  - 阶段二：仅处理状态不属于 `DONE / MATCHED / FAV_FAILED` 的歌（补齐未完成匹配）；已 DONE 的歌直接跳过（不重复发请求）；
+  - 阶段三：对 `MATCHED`（首次收藏）与 `FAV_FAILED`（重试收藏）执行 deal——直接取已匹配的 bvid，不重进阶段二、不重复搜索请求，成功即置 DONE。
 - **delete 语义**：`python main.py task delete <task_id>` 物理删除指定任务的所有状态与中间结果（`songs` 中该 `task_id` 的行及 `tasks` 表对应行）。`search_cache` 不受 delete 影响（跨任务共享，见同节），如需清理须手动。
 - **search_cache 跨任务共享**：搜索缓存以**关键词（keyword）**为 key（`search_cache` 表，TTL 7 天），缓存 key 与 `task_id` 无关——不同任务对同一关键词的搜索结果可复用，调整评分权重后重跑只重打分、不重搜索。
 - **--refresh 行为**：仅清除当前任务的匹配结果（`songs` 中 `status` 回退为 PENDING），保留 `search_cache` 和歌单抓取数据，resume 时可直接利用缓存重新匹配。
-- **增量语义**：歌单新增歌曲时，旧歌曲因 `songs.status='DONE'` 被断点续跑直接跳过（不发任何请求），只有新歌走完整状态机。`search_cache` 的作用是跨任务复用搜索结果、避免重复搜索请求，**不直接决定歌曲状态**（按 `task_id` 隔离判定状态）。
--**缓存正确性约束**：cache key 为完整 sanitize 后关键词（禁止截断/过度归一化导致碰撞）；命中缓存的结果对象按 key 隔离，禁止跨 key 复用同一可变对象；搜索返回空结果不得回退复用其他关键词的结果。
+- **增量语义**：歌单新增歌曲时，旧歌曲因 status 为 `DONE / MATCHED` 被阶段二跳过（不发任何请求），只有新歌走完整状态机；`MATCHED` 歌由阶段三补收藏。`search_cache` 的作用是跨任务复用搜索结果、避免重复搜索请求，**不直接决定歌曲状态**（按 `task_id` 隔离判定状态）。
+- **缓存正确性约束**：cache key 为完整 sanitize 后关键词（禁止截断/过度归一化导致碰撞）；命中缓存的结果对象按 key 隔离，禁止跨 key 复用同一可变对象；搜索返回空结果不得回退复用其他关键词的结果。
+- **归属校验（逐条，v0.4.3 强化）**：对搜索结果（缓存命中与实时返回同规则）**逐条**校验，不得只校验 top1——仅保留归一化标题包含**全部歌名 token** 的候选；过滤后为空视为该关键词未命中（脏缓存行作废重取；真实空结果照常进入降级链）。
+- **whitelist_bv 全量同步（v0.4.3）**：manual.json / whitelist.json 是唯一事实源，每次启动全量重建 `whitelist_bv` 表——json 新增/修改的条目更新入库，**json 中删除的条目在表中同步删除**（防止已删白名单残留生效）。
+- **schema 迁移策略（v0.4.3）**：
+  - 老库升级（v0.4.2 及之前，无 MATCHED 语义）：`songs` 表全部 DONE 行一次性转 `MATCHED`，交阶段三重新执行收藏——deal 对已收藏返回 code 0 幂等，**宁可重复收藏、不可漏收藏**；
+  - 既有迁移保留：legacy 库的 `songs_legacy` 表整体迁入 `task_id='legacy'` 任务，历史数据可查、可 resume、可 delete。
 **实测记录（2026-09-22）：B 站边缘缓存可能对不同相似查询返回逐字节相同的陈旧内容，归属校验是客户端唯一防线，不得移除。**
 ---
 
@@ -334,12 +376,15 @@ score = w1·log10(播放量+1)
 
 | 用途 | 接口 | 认证 | 备注 |
 | :--- | :--- | :--- | :--- |
-| WBI key | `GET api.bilibili.com/x/web-interface/nav` | 可选 | 取 img_key/sub_key |
+| WBI key | `GET api.bilibili.com/x/web-interface/nav` | 可选 | 取 img_key/sub_key；兜底取登录 mid（作收藏夹列表接口的 up_mid） |
 | 搜索视频 | `GET api.bilibili.com/x/web-interface/wbi/search/type?search_type=video&keyword=&page=` | buvid3 | **必须 WBI 签名** |
 | 视频详情 | `GET api.bilibili.com/x/web-interface/view?bvid=` | 可选 | 三连细分（阶段二） |
 | UP主信息 | `GET api.bilibili.com/x/relation/stat?vmid=` | 可选 | 粉丝数，按 mid 缓存 |
 | 创建收藏夹 | `POST api.bilibili.com/x/v3/fav/folder/add` | SESSDATA+bili_jct | body 含 csrf |
 | 收藏 | `POST api.bilibili.com/x/v3/fav/resource/deal` | SESSDATA+bili_jct | body: `rid&type=2&add_media_ids&del_media_ids&csrf`；`rid` 为 av 号；实测 2026-09-22 `/add` 已废弃（404） |
+| 收藏夹列表 | `GET api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid=` | SESSDATA | 复用同名夹取 `media_id`（§5.3）；**up_mid 必填** |
+
+**bvid → av 号转换（v0.4.3）**：deal 的 `rid` 为 av 号，由 `/x/web-interface/view` 完成转换；转换结果（aid）缓存，仅缓存 miss 时发请求（§8 收藏请求量的 M 项）。
 
 **错误码约定**：B 站错误同时体现在 HTTP 状态码与 body 的 `code` 字段。本文统一以 **API code**（body 中的值）为准；412 指 HTTP 状态码，`-412` 指 API code，两者同义均按风控处理。
 
@@ -362,6 +407,8 @@ score = w1·log10(播放量+1)
 ### 5.3 收藏夹拆分策略
 
 - 目标收藏夹上限按 **900/个** 留余量（防并发写入时超限），3000 首拆为 ⌈N/900⌉ 个。
+- **分配方式（v0.4.3 明确）**：按序连续分段——第 1~900 首进夹 1、第 901~1800 首进夹 2，依此类推；**禁止任何交错/轮转分配**（如多夹轮流投放），保证分段可预测、断点映射稳定。
+- **resume 重试的建夹数量（v0.4.3）**：按**当前任务的总匹配数**（而非仅本次待收藏数）计算（⌈总数/900⌉），保证复用原有同名夹、每首歌回到原属分段夹。
 - 命名：`<歌单名> (1)`、`(2)`……，重跑时优先复用已存在的同名夹（按名称查询，取其 `media_id`），不为同一任务重复建夹。
 - 建夹失败（如达 99 上限，API code `-400`）→ 停止收藏阶段，输出明确错误与当前进度，支持修复后断点续跑。
 
@@ -379,7 +426,7 @@ CREATE TABLE songs (
   album       TEXT,
   alia        TEXT,               -- JSON 数组
   origin      TEXT,               -- 翻唱原曲信息 JSON
-  status      TEXT,               -- PENDING/DONE/MANUAL/FAV_FAILED
+  status      TEXT,               -- PENDING/MATCHED/DONE/MANUAL/FAV_FAILED（MATCHED=已匹配待收藏；落地形态见 §15 决策点 a；与 §3/§4.1 三处一致）
   method      TEXT,               -- MANUAL/WHITELIST_BV/UPLOADER_WL/SCORED
   bvid        TEXT,
   score_detail TEXT,              -- 评分明细 JSON（抽查调权重用）
@@ -412,7 +459,7 @@ CREATE TABLE uploader_cache (
 CREATE TABLE whitelist_bv (
   song_key TEXT PRIMARY KEY,
   bvid     TEXT,
-  source   TEXT                   -- whitelist / manual
+  source   TEXT                   -- whitelist / manual；由 json 全量同步（§4.4：json 删除的行同步删除）
 );
 
 CREATE TABLE credentials (
@@ -428,19 +475,21 @@ CREATE TABLE kv_meta (
 );
 ```
 
+**迁移注记（v0.4.3，详见 §4.4）**：老库（v0.4.2 及之前）`songs` 全部 DONE → MATCHED（deal 幂等，重收藏不误伤）；legacy 库 `songs_legacy` 整体迁入 `task_id='legacy'` 任务（既有迁移，保留）。
+
 ---
 
 ## 7. 并发与风控策略（三层，职责分离）
 
 | 层级 | 机制 | 参数（config.yaml 可调） | 职责 |
 | :--- | :--- | :--- | :--- |
-| **预防层** | 间隔抖动：每次请求 sleep = 基础间隔 + uniform(jitter) | 搜索：400ms + 100~300ms；收藏：1000ms + 200~400ms（新账号保守默认，老账号可在 `config.yaml` 调回 500ms + 100~200ms） | 避免请求时间间隔规律化 |
+| **预防层** | 间隔抖动：**每次**请求前 sleep = interval_ms + uniform(jitter)；搜索间隔作用于**每一次搜索请求（含降级链每一轮）**，不是每首歌一次 | 搜索：400ms + 100~300ms；收藏：1000ms + 200~400ms（新账号保守默认，老账号可在 `config.yaml` 调回 500ms + 100~200ms）；阶段二补查限速取舍见 §15 决策点 c | 避免请求时间间隔规律化 |
 | **身份层** | 会话级固定 UA + 完整 header 集合 | UA 从 3 个真实浏览器 UA 中**启动时随机选一个并全程固定**；补齐 sec-ch-ua / Accept-Language / Referer | 模拟真实浏览器；**严禁**在同一 session 内切换 UA（与 SESSDATA 混用是风控特征） |
-| **响应层 a** | 单请求指数退避：412/网络错误时该请求重试，间隔 2s→4s→8s，最多 3 次 | 初始 2s，倍数 2，上限 3 次 | 处理瞬时抖动 |
-| **响应层 b** | 全局熔断：滑动窗口 60s 内 API code `-412` 达 3 次 → 全局暂停 60s；达 5 次 → 暂停 5min 并降并发 50%、输出 WARNING；`-702`（"请求频率过高"）与 `-412` 同级入熔断，但退避基数 2 倍（4s→8s→16s）；阶段三内连续 2 次 `-702` → 剩余请求 interval 翻倍（上限 4 倍）并 WARNING | 窗口 60s；阈值 3/5；降速阈值 2 次、上限 4 倍 | 持续风控时主动冷却 |；HTTP 412 且响应非 JSON（WAF 层拦截）时按 -412 计入同一窗口
+| **响应层 a** | 单请求指数退避：412/网络错误时该请求重试；重试上限 3 次指**重试次数**（初次 + 3 次重试 = 共 4 次尝试），重试间隔 2s→4s→8s；搜索与收藏统一（backoff.py 共用） | 初始 2s，倍数 2，重试上限 3 次（共 4 次尝试） | 处理瞬时抖动 |
+| **响应层 b** | 全局熔断：滑动窗口 60s 内 API code `-412` 达 3 次 → 全局暂停 60s；达 5 次 → 暂停 5min 并降并发 50%、输出 WARNING；`-702`（"请求频率过高"）与 `-412` 同级入熔断，但退避基数 2 倍（4s→8s→16s）；阶段三内连续 2 次 `-702` → 剩余请求 interval 翻倍（上限 4 倍）并 WARNING；HTTP 412 且响应非 JSON（WAF 层拦截）时按 -412 计入同一窗口；降并发 50% 须有明确生效机制（取舍见 §15 决策点 b） | 窗口 60s；阈值 3/5；降速阈值 2 次、上限 4 倍 | 持续风控时主动冷却 |
 | **响应层 c** | 认证失效：API code `-101` / `-111` → 立即中止，提示 `python main.py auth` 重新授权 | — | 凭证类错误不重试 |
 
-收藏写操作沿用更保守参数；所有限速参数集中在 `config.yaml`，可随时调。
+收藏写操作沿用更保守参数；所有限速参数集中在 `config.yaml`，可随时调。`http.timeout_s` 与 `wbi_keys_ttl_s` 同属可调参数，必须传入客户端构造、不得硬编码（兑现取舍见 §15 决策点 d）。
 
 ---
 
@@ -451,7 +500,7 @@ CREATE TABLE kv_meta (
 | 网易云抓取 | ~10 | 分页 3 次 + song/detail 3 批 | <10s |
 | 搜索匹配 | ~3000 × 1.3（降级重试约 30%，随降级链轮次增多而上升，实测后可校准） | 3900 × (0.4s + 0.2s均值抖动) ÷ 并发4 ≈ 585s | 8~13 min |
 | 阶段二补查 | ≤3000（差值明显时跳过，预估实际命中 30%） | 900 × 0.5s ÷ 4 ≈ 113s | 含在上项 |
-| 收藏 | 3000 | 3000 × (1.0s + 0.3s均值抖动) ÷ 并发1 ≈ 3900s | 默认保守档；老账号调回并发2/500ms ≈ 10 min |
+| 收藏 | N（deal）+ M（view） | N=匹配数：3000 × (1.0s + 0.3s均值抖动) ÷ 并发1 ≈ 3900s；M=bvid→av 号转换请求（§5.2），**仅 aid 缓存 miss 时发生**，量小计入余量 | 默认保守档；老账号调回并发2/500ms ≈ 10 min |
 | 风控退避开销 | — | 按 5% 请求触发一次 60s 暂停估算 | +1~2 min |
 | **合计（默认保守档）** | | | **~70 min**（收藏为主；老账号调回并发2/500ms 后 ≈ 20~30 min） |
 
@@ -473,12 +522,12 @@ CREATE TABLE kv_meta (
 
 - **已收藏（code `0`）**：视为成功，状态置 DONE，不记 fail_reason；
 - **视频不存在/被删（`-404` / `62002`）**：状态回 MANUAL 并注明，进入人工队列；
-- **其他失败**：状态回 **`FAV_FAILED`** 并记 `fail_reason`（单首歌永不使整体任务失败）；`task resume` 时只对 FAV_FAILED 重跑阶段三（§4.4），成功即回 DONE。
+- **其他失败**：状态回 **`FAV_FAILED`** 并记 `fail_reason`（单首歌永不使整体任务失败）；`task resume` 时对 `MATCHED`（首次收藏）与 `FAV_FAILED`（重试收藏）执行阶段三（§4.4），成功即回 DONE。
 
 ### 9.4 凭证安全
 
 - cookie 经 Fernet 对称加密后存入 `credentials.db`（文件权限 600），密钥派生自机器特征（如 `/etc/machine-id`）或首次运行时随机生成并存放于用户目录 600 权限文件；
-- **任何日志、报告、异常堆栈不得输出完整 cookie**：`SESSDATA`、`bili_jct`、`buvid3` 的 cookie 值一律替换为 `<redacted>`（见 §12），DEBUG 级也不例外；
+- **任何日志、报告、异常堆栈不得输出完整 cookie**：`SESSDATA`、`bili_jct`、`buvid3` 的 cookie 值一律替换为 `<redacted>`（见 §12），DEBUG 级也不例外；脱敏 Filter 必须同时覆盖普通消息与异常堆栈（`exc_info`/traceback 输出路径，v0.4.3 扩充），并有测试覆盖；
 - 文档建议用户用小号测试。
 
 ---
@@ -489,19 +538,21 @@ CREATE TABLE kv_meta (
 
 - `python main.py run <歌单ID> --dry-run`：执行阶段一、二、四报告，**跳过阶段三**。
 - 生成 `output/preview_report.html`，逐首展示：最终候选 BV、命中方式（method）、评分明细、各候选对比。用户确认后再正式运行。
-- dry-run 不写 `manual.json`、不建收藏夹，可安全重复执行；亦不重查已 DONE 与 FAV_FAILED 的歌曲（前者已完成匹配，后者问题在收藏侧，重查无意义）。
-- 状态跃迁约束：任何路径转 DONE 时 fail_reason 必须置 NULL（成功与失败原因互斥，禁止共存）。
+- dry-run 不写 `manual.json`、不建收藏夹，可安全重复执行；亦不重查已 DONE / MATCHED / FAV_FAILED 的歌曲（已完成匹配的歌重复查询无意义；FAV_FAILED 问题在收藏侧，重查不解决）。
+- 状态跃迁约束：任何路径转 DONE 时 fail_reason 必须置 NULL（成功与失败原因互斥，禁止共存）；正式运行在阶段三完成前至多 MATCHED、不置 DONE——dry-run 例外（无阶段三，匹配完成即 DONE，§4.1）。
 
 ### 10.2 人工回灌流程
 
 1. 正式跑完后 `output/review.html` 列出所有 **MANUAL 和 FAV_FAILED** 歌曲（FAV_FAILED 附 fail_reason），每首附 B 站搜索跳转链接。
 2. 用户在 review.html 页面内直接填写 BV 号并保存（见 §10.3），或手动编辑 `manual.json`（`{"歌名|歌手": "BV1xxxxx"}`）——两种方式等价。
-3. 重跑程序：`manual.json` 按 §4.1 优先级铁律**最高优先级**生效，直接入夹。
+3. 重跑程序：`manual.json` 按 §4.1 优先级铁律**最高优先级**生效，匹配置 MATCHED 后由阶段三收藏入夹。
 
 ### 10.3 review.html 本地保存服务
 
 - `report.py` 生成 review.html 后，可选择启动 `review_server.py`：`127.0.0.1` 随机端口，仅监听回环地址，仅处理 POST `/save`。
 - 页面内嵌 fetch 调用 `http://127.0.0.1:<port>/save`，body 为 `{song_key, bvid}`；服务端做 BV 号格式校验（`^BV1[a-zA-Z0-9]{9}$`）。
+- **写入侧安全（v0.4.3）**：服务启动时生成一次性 token 注入页面，POST `/save` 必须携带且校验通过；校验请求 `Origin` 头（仅接受 `http://127.0.0.1:<port>` 同源）；`song_key` 长度设上限（超长直接拒绝），防滥用写入。
+- **前端传参（v0.4.3）**：review.html 的 BV 号与 song_key 经 `data-*` 属性 + 事件委托读取，废除 onclick 字符串拼接（消除 HTML 注入/XSS 面）。
 - 写入采用"读-改-写 + 原子替换"（写临时文件后 `os.replace`），防止并发写损坏 `manual.json`。
 - 服务生命周期 = 用户浏览器标签页打开期间；用户也可完全跳过它走手动编辑路径。该服务不暴露任何歌单/cookie 数据，仅接收 BV 号。
 - 此服务为**本地开发便利设施**，非 Web 产品（非目标 §1.2 仍然成立）。
@@ -512,7 +563,7 @@ CREATE TABLE kv_meta (
 
 ### 11.1 环境要求
 
-- Python ≥ 3.11（使用 `asyncio.TaskGroup` 与 `tomllib`/类型标注新语法）。
+- Python ≥ 3.11（依赖现代类型标注语法；并发编排使用 `asyncio.gather`，配置解析使用 PyYAML）。
 
 ### 11.2 安装步骤
 
@@ -565,7 +616,9 @@ python main.py report --task-id <task_id>   # 仅报告指定任务的歌曲（�
 python main.py report --serve               # 生成 review.html 并启动本地保存服务（§10.3）
 ```
 
-**任务生命周期**：每次 `run`（无论 `--dry-run` 还是正式运行）自动生成唯一 `task_id` 并写入 `tasks` 表；`resume` 加载指定任务的 `songs` 状态，已 DONE 的歌跳过；`delete` 物理清除该任务的所有数据。`search_cache` 不受 `delete` 影响（跨任务共享，见 §4.4）。
+**任务生命周期**：每次 `run`（无论 `--dry-run` 还是正式运行）自动生成唯一 `task_id` 并写入 `tasks` 表；`resume` 加载指定任务的 `songs` 状态，已 DONE/MATCHED/FAV_FAILED 的歌跳过阶段二，MATCHED/FAV_FAILED 进阶段三收藏（§4.4）；`delete` 物理清除该任务的所有数据。`search_cache` 不受 `delete` 影响（跨任务共享，见 §4.4）。
+
+**路径基准（v0.4.3）**：所有数据文件路径（`cache.db`、`credentials.db`、`whitelist.json`、`manual.json`、`output/`、`logs/` 等）均基于项目根解析（`Path(__file__).resolve().parent`），与 CWD 无关——任意目录下执行 `python main.py ...` 行为一致。
 
 ---
 
@@ -584,7 +637,7 @@ python main.py report --serve               # 生成 review.html 并启动本地
 - **输出**：
   - 控制台：INFO 及以上，格式简洁；
   - 文件：`logs/app_YYYY-MM-DD.log`，全级别，含时间/模块/级别。
-- **脱敏铁律**：日志 Filter 在 Formatter 前对 `SESSDATA=[^;]*`、`bili_jct=[^;]*`、`buvid3=[^;]*` 统一替换为 `<redacted>`；DEBUG 级也不例外。测试用例覆盖该 Filter。
+- **脱敏铁律**：日志 Filter 在 Formatter 前对 `SESSDATA=[^;]*`、`bili_jct=[^;]*`、`buvid3=[^;]*` 统一替换为 `<redacted>`；DEBUG 级也不例外；Filter 作用域含异常堆栈（`exc_info`），与 §9.4 一致。测试用例覆盖该 Filter（含 exc_info 路径）。
 
 ---
 ## 13. 测试策略
@@ -605,7 +658,7 @@ python main.py report --serve               # 生成 review.html 并启动本地
 - 任务 resume：中途杀掉进程，`task resume <task_id>` 重启验证无重复请求（替代原断点续跑用例）；
 - 任务 delete：`task delete <task_id>` 验证该任务的 songs/tasks 行被清除，search_cache 行保留；
 - 任务 list：`task list` 验证任务列表及状态展示正确；
-- 收藏失败 → FAV_FAILED → `task resume` 验证只重发 deal 请求、无搜索请求，成功后回 DONE。
+- 收藏链路（对齐 MATCHED 语义，v0.4.3）：MATCHED → fav_one 成功 → DONE（阶段三完成前不得 DONE）；收藏失败 → FAV_FAILED → `task resume` 验证阶段三对 MATCHED/FAV_FAILED 只重发 deal 请求、无搜索请求，成功后回 DONE；deal 幂等（code 0）不误报；老库迁移 DONE→MATCHED 重收藏路径覆盖（§4.4）。
 
 ### 13.3 Mock 铁律
 
@@ -623,3 +676,45 @@ python main.py report --serve               # 生成 review.html 并启动本地
 | 权重自学习 | 用 `score_detail` + 人工回灌结果做简单回归，自动调 w1/w2/w3 |
 
 **当前明确不做**：RabbitMQ、分布式、公网 Web 后台。单机 SQLite + asyncio 已满足全部指标，避免过度设计。
+
+---
+
+## 15. v0.4.3 决策记录（待逐条确认后定稿）
+
+> 以下 4 项为两轮代码审查后的待定取舍；正文相关位置已以"见 §15 决策点 X"标注依赖。逐条确认后，本节内容并入正文对应章节并删除本提示。
+
+### 决策点 a：MATCHED 落地形态（§4.1/§6）
+
+| 选项 | 内容 | 代价/收益 |
+| :--- | :--- | :--- |
+| A（推荐） | 新增状态值 MATCHED | 语义清晰；resume 跳过条件、报告分组、SQL 过滤直接按 status 判定；需一次性迁移（§4.4）并同步 DDL 注释与测试 |
+| B | 不加状态，新增 fav_done 布尔标记列，DONE 含义回退为"匹配完成" | 兼容旧枚举、免迁移；但"匹配完成"与"收藏完成"无法从 status 区分，resume 与报告判定均需叠加标记列条件，语义污染 |
+
+**推荐 A**。理由：项目处于实测期、无多环境历史包袱，迁移成本一次付清（deal 幂等兜底，§4.4 迁移策略已定义）；语义正确性的长期收益大于一次性迁移成本。
+
+### 决策点 b：降并发 50% 的生效机制（§7 响应层 b）
+
+| 选项 | 内容 | 代价/收益 |
+| :--- | :--- | :--- |
+| A（推荐） | worker 入口补偿：降速生效后，每个工作协程取任务时按 multiplier 追加 sleep | 实现简单、无锁、节流必然生效；名义并发数不变，仅请求节奏放慢 |
+| B | 动态许可闸：可调容量的 semaphore/令牌桶动态收缩在途并发 | 精确；需跨协程动态调整许可并处理排空，复杂度高 |
+
+**推荐 A**，并配集成测试断言降速生效后单位时间请求量下降。理由：风控感知的是请求频率而非协程数，补偿 sleep 直接命中目标；B 的精确度对本场景无必要。
+
+### 决策点 c：stage2 限速（§7 预防层）
+
+| 选项 | 内容 | 代价/收益 |
+| :--- | :--- | :--- |
+| A（推荐） | 接入 rate_limit.stage2 配置：阶段二补查请求独立过 interval + jitter | 与 §7"所有限速参数集中在 config.yaml 可调"承诺一致；改动小 |
+| B | 删除该配置段 | 减少潜在死配置；但阶段二同为出站请求，留下可调承诺的空档 |
+
+**推荐 A**。理由：§7 已承诺"所有限速参数可调"，阶段二请求量虽小（预估 30% 命中）但并非为零。若确认 B，须同步删除 config.yaml 对应段并在 §7 注明阶段二限速继承搜索节奏。
+
+### 决策点 d：http.timeout_s / wbi_keys_ttl_s 接线（§7 末句）
+
+| 选项 | 内容 | 代价/收益 |
+| :--- | :--- | :--- |
+| A（推荐） | 两配置必须传入客户端构造（httpx 超时、WBI key TTL 不再硬编码），作为 v0.4.3 兑现项写入 §7 可调参数清单 | 消除"配置已暴露但未接线"的死配置（与 UA 随机化同类教训）；改动小、风险低 |
+| B | 维持代码内常量，从 config.yaml 删除对应键 | 零改动；但配置文件保留无效键会误导用户 |
+
+**推荐 A**。理由：配置项已在 config.yaml 暴露即构成隐性承诺，接线成本低。
