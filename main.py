@@ -151,12 +151,11 @@ async def run_dry_run(
         pending.append(song)
 
     sem = asyncio.Semaphore(config.rate_limit.search.concurrency)  # 文档 §7 搜索并发 4
-    search_rl = config.rate_limit.search
 
     async def worker(song: dict) -> dict:
         async with sem:
-            # 文档 §7 预防层：间隔 jitter
-            await asyncio.sleep(random.uniform(*search_rl.jitter_ms) / 1000)
+            # 文档 §7 预防层 / F1-1：搜索间隔 sleep 已下沉到
+            # matcher._search_cached（每次搜索请求，含降级链每一轮、缓存命中）。
             return await matcher.match_song(song)
 
     # 任一歌中断（网络/风控异常）时，取消并等待其余 task 收尾，
@@ -288,14 +287,18 @@ def _report_command(args: argparse.Namespace) -> None:
         rows = [dict(r) for r in rows]
 
         save_url: str | None = None
+        token = ""
         if args.serve:
             from review_server import serve_in_background
 
-            server, port = serve_in_background("manual.json", db=db)
+            server, port, token = serve_in_background("manual.json", db=db)
             save_url = f"http://127.0.0.1:{port}/save"
             print(f"本地保存服务已启动：{save_url}（Ctrl+C 停止）")
 
-        html_path = write_review_html(rows, _DEFAULT_OUTPUT_DIR / "review.html", save_url=save_url)
+        html_path = write_review_html(
+            rows, _DEFAULT_OUTPUT_DIR / "review.html",
+            save_url=save_url, token=token,
+        )
         print(f"review.html 已生成: {html_path}")
 
         if args.serve:

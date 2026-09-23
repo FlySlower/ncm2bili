@@ -419,18 +419,46 @@ async def fav_songs(
     *,
     media_ids: list[int] | None = None,
 ) -> dict:
-    """批量收藏（文档 §7 收藏参数）：并发 + jitter；-101 立即中止。
+    """批量收藏（文档 §7 收藏参数 + §5.3 按序连续分段）。
+
+    F1-3（§5.3）：收藏夹分配改按序连续分段（第 i 首进夹 ⌊i/per_folder_limit⌋），
+    禁止轮转；resume 建夹数量按任务总匹配数计算，保证歌进原夹。断点映射按
+    song_key 排序定序（并发插入序不确定，须显式排序稳定映射）。
 
     Args:
-        media_ids: 预分配的收藏夹 media_id 列表；None 时按歌单名自动拆分创建。
+        media_ids: 预分配的收藏夹 media_id 列表；None 时按任务总匹配数自动建夹。
     """
-    if media_ids is None:
-        media_ids = await client.ensure_folders(playlist_name, len(songs))
+    if not songs:
+        return {"total": 0, "statuses": {}}
 
-    # 按序均分到各收藏夹（round-robin），避免单夹过载
-    assigned = [
-        (media_ids[i % len(media_ids)], song) for i, song in enumerate(songs)
-    ]
+    per_folder_limit = config.fav.per_folder_limit
+    task_id = songs[0].get("task_id") or "default"
+
+    # F1-3（§5.3）：按 song_key 排序查询全任务匹配数，建立稳定 ordinal 映射。
+    # 并发下 songs 插入序不确定，须显式排序保证断点映射稳定（同一首歌恒进原夹）。
+    rows = db.query(
+        "SELECT song_key FROM songs WHERE task_id = ? AND bvid IS NOT NULL "
+        "AND status IN ('DONE','MATCHED','FAV_FAILED') ORDER BY song_key",
+        (task_id,),
+    )
+    ordinal = {r["song_key"]: i for i, r in enumerate(rows)}
+    total_matched = len(ordinal)
+
+    if media_ids is None:
+        # F1-3（§5.3）：resume 建夹数量按任务总匹配数（非仅本次待收藏数），
+        # 保证复用原有同名夹、每首歌回到原属分段夹；total_matched 为 0 时（DB 未落盘）
+        # 回退到本次传入数（兼容测试/非标准调用）。
+        media_ids = await client.ensure_folders(
+            playlist_name, total_matched or len(songs)
+        )
+
+    # 按序连续分段（禁止轮转）：第 i 首进夹 ⌊ordinal/per_folder_limit⌋，封顶末夹
+    assigned = []
+    for i, song in enumerate(songs):
+        key = song.get("song_key") or f"{song.get('name')}|{song.get('artist')}"
+        pos = ordinal.get(key, i)  # DB 未命中时回退本次序号（防御）
+        folder_idx = min(pos // per_folder_limit, len(media_ids) - 1)
+        assigned.append((media_ids[folder_idx], song))
 
     rl = config.rate_limit.fav
     sem = asyncio.Semaphore(rl.concurrency)

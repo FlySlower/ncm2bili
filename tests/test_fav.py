@@ -264,6 +264,144 @@ async def test_fav_songs_batch(tmp_path) -> None:
     assert done["n"] == 10
 
 
+# ---- F1-3：按序连续分段 + resume 稳定映射（文档 §5.3）-----------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fav_songs_sequential_segmentation_no_roundrobin(tmp_path) -> None:
+    """F1-3（§5.3）：5 首歌 → 3 夹（per_folder_limit=2），按序连续分段禁止轮转。
+
+    song_key 字典序 "歌1|艺1" < ... < "歌5|艺5" 形成 ordinal 0-4，验证
+    第 1,2 首 → 夹 1（media_id=10）；第 3,4 首 → 夹 2（media_id=20）；
+    第 5 首 → 夹 3（media_id=30）。若为 round-robin 则每首进不同夹。
+    """
+    db = Database(tmp_path / "t.db")
+    # 预置 5 首歌 DONE（含 bvid，供 ordinal 查询稳定定序）
+    for i in range(1, 6):
+        db.upsert_song(
+            f"歌{i}|艺{i}", task_id="t1", status="DONE",
+            bvid=f"BV1x{i}", ncm_id=i,
+        )
+    # VIEW：按 bvid 末位返回唯一 aid（aid=2000+i 便于反查）
+    def view_handler(request: httpx.Request) -> httpx.Response:
+        bvid = parse_qs(request.url.query.decode()).get("bvid", [""])[0]
+        i = int(bvid[-1])
+        return httpx.Response(200, json={"code": 0, "data": {"aid": 2000 + i}})
+    respx.get(VIEW_URL).mock(side_effect=view_handler)
+    # 建夹：3 个 media_id 10/20/30
+    respx.get(FOLDER_LIST_URL).mock(return_value=_ok(list=[]))
+    folder_seq = [0]
+
+    def add_handler(request: httpx.Request) -> httpx.Response:
+        folder_seq[0] += 1
+        return _ok(id=folder_seq[0] * 10)  # 10, 20, 30
+
+    respx.post(FOLDER_ADD_URL).mock(side_effect=add_handler)
+    # RESOURCE deal：捕获 (media_id, aid) 供反查
+    added: list[tuple[int, int]] = []
+
+    def resource_handler(request: httpx.Request) -> httpx.Response:
+        body = _form_body(request)
+        added.append((int(body["add_media_ids"]), int(body["rid"])))
+        return httpx.Response(200, json={"code": 0})
+
+    respx.post(RESOURCE_ADD_URL).mock(side_effect=resource_handler)
+
+    songs = [_song(f"歌{i}|艺{i}", f"BV1x{i}") for i in range(1, 6)]
+    for s in songs:
+        s["task_id"] = "t1"
+
+    cfg = Config()
+    cfg.fav.per_folder_limit = 2
+    cfg.rate_limit.fav.interval_ms = 0
+    cfg.rate_limit.fav.jitter_ms = [0, 0]
+    client = _client(db, cfg)
+    async with client._client:
+        summary = await fav_songs(client, db, cfg, songs, "歌单")
+
+    assert summary["total"] == 5
+    assert summary["statuses"]["DONE"] == 5
+    # 建夹数 = ceil(5/2) = 3
+    assert folder_seq[0] == 3
+    # 反查 aid → media_id，验证按序连续分段（非 round-robin）
+    aid_to_media = {aid: mid for mid, aid in added}
+    for i in range(1, 6):
+        aid = 2000 + i
+        expected_folder = (i - 1) // 2  # 0,0,1,1,2
+        expected_media_id = [10, 20, 30][expected_folder]
+        assert aid_to_media[aid] == expected_media_id, (
+            f"song {i}: media_id={aid_to_media[aid]}, expected={expected_media_id}"
+        )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fav_songs_resume_uses_total_matched_for_folders(tmp_path) -> None:
+    """F1-3（§5.3）：resume 只传失败子集，建夹按任务总匹配数（非子集数）。
+
+    5 首中 s3/s5 FAV_FAILED 需 resume，s1/s2/s4 DONE。传 s3/s5 子集：
+    - 建夹数按 total_matched=5 → ceil(5/2)=3 夹（非 2 首的 1 夹）；
+    - s3 ordinal=2 → 夹 2（media_id=20）、s5 ordinal=4 → 夹 3（media_id=30），
+      按 global ordinal（非 round-robin 的 10/20）。
+    """
+    db = Database(tmp_path / "t.db")
+    # 全 5 首入 DB：s1/s2/s4 DONE，s3/s5 FAV_FAILED（仍带 bvid，供 ordinal 查询）
+    for i in range(1, 6):
+        db.upsert_song(
+            f"歌{i}|艺{i}", task_id="t1",
+            status="DONE" if i in (1, 2, 4) else "FAV_FAILED",
+            bvid=f"BV1x{i}", ncm_id=i,
+        )
+
+    def view_handler(request: httpx.Request) -> httpx.Response:
+        bvid = parse_qs(request.url.query.decode()).get("bvid", [""])[0]
+        i = int(bvid[-1])
+        return httpx.Response(200, json={"code": 0, "data": {"aid": 2000 + i}})
+
+    respx.get(VIEW_URL).mock(side_effect=view_handler)
+    respx.get(FOLDER_LIST_URL).mock(return_value=_ok(list=[]))
+    folder_seq = [0]
+
+    def add_handler(request: httpx.Request) -> httpx.Response:
+        folder_seq[0] += 1
+        return _ok(id=folder_seq[0] * 10)
+
+    respx.post(FOLDER_ADD_URL).mock(side_effect=add_handler)
+    added: list[tuple[int, int]] = []
+
+    def resource_handler(request: httpx.Request) -> httpx.Response:
+        body = _form_body(request)
+        added.append((int(body["add_media_ids"]), int(body["rid"])))
+        return httpx.Response(200, json={"code": 0})
+
+    respx.post(RESOURCE_ADD_URL).mock(side_effect=resource_handler)
+
+    # resume 只传失败子集 s3, s5
+    songs = [_song(f"歌{i}|艺{i}", f"BV1x{i}") for i in (3, 5)]
+    for s in songs:
+        s["task_id"] = "t1"
+
+    cfg = Config()
+    cfg.fav.per_folder_limit = 2
+    cfg.rate_limit.fav.interval_ms = 0
+    cfg.rate_limit.fav.jitter_ms = [0, 0]
+    client = _client(db, cfg)
+    async with client._client:
+        summary = await fav_songs(client, db, cfg, songs, "歌单")
+
+    assert summary["total"] == 2
+    assert summary["statuses"]["DONE"] == 2
+    # 建夹数：按 total_matched=5 → 3 夹（非 2 首的 1 夹）
+    assert folder_seq[0] == 3
+    # 反查 aid → media_id（按 global ordinal，非 round-robin）
+    aid_to_media = {aid: mid for mid, aid in added}
+    # s3 ordinal=2 → folder_idx=2//2=1 → media_id=20（非 round-robin 的 10）
+    assert aid_to_media[2003] == 20
+    # s5 ordinal=4 → folder_idx=4//2=2 → media_id=30（非 round-robin 的 20）
+    assert aid_to_media[2005] == 30
+
+
 # ---- 412 退避 + 熔断（文档 §7 响应层 a/b）------------------------------
 
 
