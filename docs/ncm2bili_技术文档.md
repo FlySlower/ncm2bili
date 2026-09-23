@@ -123,7 +123,9 @@
 | §11.1 如实描述依赖：asyncio.gather + PyYAML（原文误写 TaskGroup 与 tomllib） | 修正 | §11.1 |
 | whitelist_bv 全量同步语义：json 删除的条目在表中同步删除 | 补充 | §4.4/§6 |
 | §11.4 所有数据文件路径基于项目根（`Path(__file__).resolve().parent`），CWD 无关 | 补充 | §11.4 |
-| 新增 §15 决策记录（4 项待确认）：MATCHED 落地形态 / 降并发 50% 生效机制 / stage2 限速 / http.timeout_s 与 wbi_keys_ttl_s 接线 | 决策 | §7/§15 |
+| 降并发 50% 生效机制定稿：worker 入口按 multiplier 追加 sleep 补偿（风控感知请求频率而非协程数），配集成测试断言请求量下降 | 决策 | §7 响应层 b |
+| stage2 限速定稿：接入 rate_limit.stage2 配置，阶段二补查独立过 interval + jitter | 决策 | §7 预防层 |
+| http.timeout_s 与 wbi_keys_ttl_s 定稿：必须传入客户端构造、不得硬编码（消除已暴露未接线的死配置） | 决策 | §7 末句 |
 | §13.2 收藏链路测试对齐 MATCHED 语义 | 测试 | §13.2 |
 
 ---
@@ -270,7 +272,7 @@ ncm2bili/
 **状态跃迁语义（v0.4.3 新增 MATCHED）**：
 
 - **MATCHED（已匹配待收藏）** 是匹配成功的统一落点：`matcher._finish()` 写 MATCHED；仅 `fav_one()`（fav.py）收藏成功才写 DONE。正式运行时，任务在阶段三完成前任何歌曲不得置 DONE；dry-run 例外——无阶段三，`_finish()` 直接置 DONE（§10.1）。
-- 状态枚举：`PENDING / MATCHED / DONE / MANUAL / FAV_FAILED`——§3 架构图、§4.1、§6 DDL 三处一致；MATCHED 落地形态取舍见 §15 决策点 a。
+- 状态枚举：`PENDING / MATCHED / DONE / MANUAL / FAV_FAILED`——§3 架构图、§4.1、§6 DDL 三处一致（MATCHED 定稿为新增状态值，非 fav_done 标记列）。
 - resume：阶段二跳过 `DONE / MATCHED / FAV_FAILED`；阶段三对 `MATCHED`（首次收藏）与 `FAV_FAILED`（重试收藏）执行收藏（§4.4）。
 - ④ 命中判断为**归一化对归一化**：`_normalize(name) in _normalize(title)`（v0.4.3 修正：原表述"标题含歌名"为原文子串匹配，大小写/全半角/空白差异会漏判）。
 
@@ -426,7 +428,7 @@ CREATE TABLE songs (
   album       TEXT,
   alia        TEXT,               -- JSON 数组
   origin      TEXT,               -- 翻唱原曲信息 JSON
-  status      TEXT,               -- PENDING/MATCHED/DONE/MANUAL/FAV_FAILED（MATCHED=已匹配待收藏；落地形态见 §15 决策点 a；与 §3/§4.1 三处一致）
+  status      TEXT,               -- PENDING/MATCHED/DONE/MANUAL/FAV_FAILED（MATCHED=已匹配待收藏；与 §3/§4.1 三处一致）
   method      TEXT,               -- MANUAL/WHITELIST_BV/UPLOADER_WL/SCORED
   bvid        TEXT,
   score_detail TEXT,              -- 评分明细 JSON（抽查调权重用）
@@ -483,13 +485,13 @@ CREATE TABLE kv_meta (
 
 | 层级 | 机制 | 参数（config.yaml 可调） | 职责 |
 | :--- | :--- | :--- | :--- |
-| **预防层** | 间隔抖动：**每次**请求前 sleep = interval_ms + uniform(jitter)；搜索间隔作用于**每一次搜索请求（含降级链每一轮）**，不是每首歌一次 | 搜索：400ms + 100~300ms；收藏：1000ms + 200~400ms（新账号保守默认，老账号可在 `config.yaml` 调回 500ms + 100~200ms）；阶段二补查限速取舍见 §15 决策点 c | 避免请求时间间隔规律化 |
+| **预防层** | 间隔抖动：**每次**请求前 sleep = interval_ms + uniform(jitter)；搜索间隔作用于**每一次搜索请求（含降级链每一轮）**，不是每首歌一次 | 搜索：400ms + 100~300ms；收藏：1000ms + 200~400ms（新账号保守默认，老账号可在 `config.yaml` 调回 500ms + 100~200ms）；阶段二补查经 rate_limit.stage2 独立限速（interval + jitter） | 避免请求时间间隔规律化 |
 | **身份层** | 会话级固定 UA + 完整 header 集合 | UA 从 3 个真实浏览器 UA 中**启动时随机选一个并全程固定**；补齐 sec-ch-ua / Accept-Language / Referer | 模拟真实浏览器；**严禁**在同一 session 内切换 UA（与 SESSDATA 混用是风控特征） |
 | **响应层 a** | 单请求指数退避：412/网络错误时该请求重试；重试上限 3 次指**重试次数**（初次 + 3 次重试 = 共 4 次尝试），重试间隔 2s→4s→8s；搜索与收藏统一（backoff.py 共用） | 初始 2s，倍数 2，重试上限 3 次（共 4 次尝试） | 处理瞬时抖动 |
-| **响应层 b** | 全局熔断：滑动窗口 60s 内 API code `-412` 达 3 次 → 全局暂停 60s；达 5 次 → 暂停 5min 并降并发 50%、输出 WARNING；`-702`（"请求频率过高"）与 `-412` 同级入熔断，但退避基数 2 倍（4s→8s→16s）；阶段三内连续 2 次 `-702` → 剩余请求 interval 翻倍（上限 4 倍）并 WARNING；HTTP 412 且响应非 JSON（WAF 层拦截）时按 -412 计入同一窗口；降并发 50% 须有明确生效机制（取舍见 §15 决策点 b） | 窗口 60s；阈值 3/5；降速阈值 2 次、上限 4 倍 | 持续风控时主动冷却 |
+| **响应层 b** | 全局熔断：滑动窗口 60s 内 API code `-412` 达 3 次 → 全局暂停 60s；达 5 次 → 暂停 5min 并降并发 50%、输出 WARNING；`-702`（"请求频率过高"）与 `-412` 同级入熔断，但退避基数 2 倍（4s→8s→16s）；阶段三内连续 2 次 `-702` → 剩余请求 interval 翻倍（上限 4 倍）并 WARNING；HTTP 412 且响应非 JSON（WAF 层拦截）时按 -412 计入同一窗口；降并发 50% 经 worker 入口补偿实现——降速生效后每个工作协程取任务时按 multiplier 追加 sleep（风控感知请求频率而非协程数；配集成测试断言单位时间请求量下降） | 窗口 60s；阈值 3/5；降速阈值 2 次、上限 4 倍 | 持续风控时主动冷却 |
 | **响应层 c** | 认证失效：API code `-101` / `-111` → 立即中止，提示 `python main.py auth` 重新授权 | — | 凭证类错误不重试 |
 
-收藏写操作沿用更保守参数；所有限速参数集中在 `config.yaml`，可随时调。`http.timeout_s` 与 `wbi_keys_ttl_s` 同属可调参数，必须传入客户端构造、不得硬编码（兑现取舍见 §15 决策点 d）。
+收藏写操作沿用更保守参数；所有限速参数集中在 `config.yaml`，可随时调。`http.timeout_s` 与 `wbi_keys_ttl_s` 同属可调参数，必须传入客户端构造、不得硬编码（消除已暴露但未接线的死配置）。
 
 ---
 
@@ -676,45 +678,3 @@ python main.py report --serve               # 生成 review.html 并启动本地
 | 权重自学习 | 用 `score_detail` + 人工回灌结果做简单回归，自动调 w1/w2/w3 |
 
 **当前明确不做**：RabbitMQ、分布式、公网 Web 后台。单机 SQLite + asyncio 已满足全部指标，避免过度设计。
-
----
-
-## 15. v0.4.3 决策记录（待逐条确认后定稿）
-
-> 以下 4 项为两轮代码审查后的待定取舍；正文相关位置已以"见 §15 决策点 X"标注依赖。逐条确认后，本节内容并入正文对应章节并删除本提示。
-
-### 决策点 a：MATCHED 落地形态（§4.1/§6）
-
-| 选项 | 内容 | 代价/收益 |
-| :--- | :--- | :--- |
-| A（推荐） | 新增状态值 MATCHED | 语义清晰；resume 跳过条件、报告分组、SQL 过滤直接按 status 判定；需一次性迁移（§4.4）并同步 DDL 注释与测试 |
-| B | 不加状态，新增 fav_done 布尔标记列，DONE 含义回退为"匹配完成" | 兼容旧枚举、免迁移；但"匹配完成"与"收藏完成"无法从 status 区分，resume 与报告判定均需叠加标记列条件，语义污染 |
-
-**推荐 A**。理由：项目处于实测期、无多环境历史包袱，迁移成本一次付清（deal 幂等兜底，§4.4 迁移策略已定义）；语义正确性的长期收益大于一次性迁移成本。
-
-### 决策点 b：降并发 50% 的生效机制（§7 响应层 b）
-
-| 选项 | 内容 | 代价/收益 |
-| :--- | :--- | :--- |
-| A（推荐） | worker 入口补偿：降速生效后，每个工作协程取任务时按 multiplier 追加 sleep | 实现简单、无锁、节流必然生效；名义并发数不变，仅请求节奏放慢 |
-| B | 动态许可闸：可调容量的 semaphore/令牌桶动态收缩在途并发 | 精确；需跨协程动态调整许可并处理排空，复杂度高 |
-
-**推荐 A**，并配集成测试断言降速生效后单位时间请求量下降。理由：风控感知的是请求频率而非协程数，补偿 sleep 直接命中目标；B 的精确度对本场景无必要。
-
-### 决策点 c：stage2 限速（§7 预防层）
-
-| 选项 | 内容 | 代价/收益 |
-| :--- | :--- | :--- |
-| A（推荐） | 接入 rate_limit.stage2 配置：阶段二补查请求独立过 interval + jitter | 与 §7"所有限速参数集中在 config.yaml 可调"承诺一致；改动小 |
-| B | 删除该配置段 | 减少潜在死配置；但阶段二同为出站请求，留下可调承诺的空档 |
-
-**推荐 A**。理由：§7 已承诺"所有限速参数可调"，阶段二请求量虽小（预估 30% 命中）但并非为零。若确认 B，须同步删除 config.yaml 对应段并在 §7 注明阶段二限速继承搜索节奏。
-
-### 决策点 d：http.timeout_s / wbi_keys_ttl_s 接线（§7 末句）
-
-| 选项 | 内容 | 代价/收益 |
-| :--- | :--- | :--- |
-| A（推荐） | 两配置必须传入客户端构造（httpx 超时、WBI key TTL 不再硬编码），作为 v0.4.3 兑现项写入 §7 可调参数清单 | 消除"配置已暴露但未接线"的死配置（与 UA 随机化同类教训）；改动小、风险低 |
-| B | 维持代码内常量，从 config.yaml 删除对应键 | 零改动；但配置文件保留无效键会误导用户 |
-
-**推荐 A**。理由：配置项已在 config.yaml 暴露即构成隐性承诺，接线成本低。
