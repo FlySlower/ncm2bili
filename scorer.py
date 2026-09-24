@@ -26,9 +26,8 @@ _RELATION_STAT_URL = "https://api.bilibili.com/x/relation/stat"
 # 文档 §4.2：标题关键词 bonus 集合
 _TITLE_KEYWORDS = ("官方", "原唱", "MV", "音频", "歌词", "完整版")
 
-# 营销号特征阈值（粉丝极少但播放异常高）
+# 营销号特征阈值（阶段二沉底：粉丝极少）
 _SPAM_FOLLOWER_THRESHOLD = 100
-_SPAM_PLAY_THRESHOLD = 100_000
 
 
 def _norm(text: str) -> str:
@@ -70,7 +69,10 @@ def stage1_score(video: dict[str, Any], song_name: str, config: ScoringConfig) -
     公式：w1·log10(播放+1) + w2·log10(收藏+1) + w3·log10(评论+1)
           + title_bonus（标题含歌名 +10；含 官方/原唱/MV/音频/歌词/完整版 每项 +3）
           + duration_bonus（1~8 分钟 +5；<30s 或 >10min −10）
-          − author_penalty（营销号特征 −15，需已知粉丝数）
+
+    V5-P2-8：原 − author_penalty 分支依赖 follower 字段，但搜索 _candidate()
+    不产出 follower，该分支在生产链路恒不触发（死配置），随配置项一并删除；
+    营销号识别仅保留在阶段二沉底（补查 follower 后，见 rank_candidates）。
     """
     play = float(video.get("play") or 0)
     fav = float(video.get("favorites") or 0)
@@ -98,9 +100,6 @@ def stage1_score(video: dict[str, Any], song_name: str, config: ScoringConfig) -
         score += config.duration_short_penalty
     elif duration > 10 * 60:
         score += config.duration_long_penalty
-    follower = video.get("follower")
-    if follower is not None and follower < _SPAM_FOLLOWER_THRESHOLD and play > _SPAM_PLAY_THRESHOLD:
-        score += config.author_penalty
     return round(score, 4)
 
 
@@ -145,6 +144,7 @@ async def rank_candidates(
     db: Database | None,
     *,
     rate_limit: RateLimitSection | None = None,
+    concurrency_multiplier: float = 1.0,
 ) -> list[dict]:
     """文档 §4.2 两阶段排序。
 
@@ -155,6 +155,11 @@ async def rank_candidates(
     F4-3（文档 §7 预防层）：rate_limit 传入时阶段二补查不再裸发请求——每个
     候选补查前 sleep = interval_ms + uniform(jitter_ms)，并以 Semaphore
     (concurrency) 封顶并发；None 时不限速（保留直接调用的测试/兼容路径）。
+
+    V5-P2-9（§7 响应层 b）：concurrency_multiplier 接入熔断降速补偿——critical
+    熔断后 multiplier=0.5，阶段二两处补查（view/relation，统一在 _fetch_pair 前
+    一次 sleep）间隔翻倍，写法对齐 fav.py（base / multiplier；风控感知请求频率
+    而非协程数）。由 matcher 经 self._bili.concurrency_multiplier 传入。
     """
     for cand in candidates:
         cand["score"] = stage1_score(cand, song_name, config)
@@ -175,8 +180,12 @@ async def rank_candidates(
     async def _enrich(cand: dict) -> None:
         if sem is not None:
             async with sem:
+                # V5-P2-9（§7 响应层 b）：熔断 critical 后 multiplier=0.5，
+                # 间隔 = (interval+jitter) / multiplier 翻倍（对齐 fav.py）
                 await asyncio.sleep(
-                    (rate_limit.interval_ms + random.uniform(*rate_limit.jitter_ms)) / 1000
+                    (rate_limit.interval_ms + random.uniform(*rate_limit.jitter_ms))
+                    / 1000
+                    / concurrency_multiplier
                 )
                 await _fetch_pair(cand)
         else:

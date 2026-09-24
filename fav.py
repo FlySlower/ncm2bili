@@ -523,7 +523,18 @@ async def fav_songs(
             return await client.fav_one(media_id, song)
 
     tasks = [asyncio.create_task(worker(mid, song)) for mid, song in assigned]
-    results = await asyncio.gather(*tasks)
+    # V5-P2-11（§4.4/§9.2）：对齐阶段二 main.py 的取消写法——任一 worker 抛
+    # 中止类异常（-101/-111 凭证失效、-400 建夹上限等穿透 fav_one 的异常）时，
+    # 显式 cancel 其余 worker 并等待收尾（gather(return_exceptions=True) 聚合
+    # 已完成/取消结果），再原样抛出。修复前裸 gather 异常后其余 worker 只能等
+    # asyncio.run 收尾，取消不对称、后台残留请求。
+    try:
+        results = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
     statuses: dict[str, int] = {}
     for r in results:

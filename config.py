@@ -95,7 +95,6 @@ class ScoringConfig(BaseModel):
     duration_bonus: float = 5       # 1~8 分钟
     duration_short_penalty: float = -10  # <30s
     duration_long_penalty: float = -10   # >10min
-    author_penalty: float = -15     # 营销号特征
     stage2_diff_threshold: float = 0.10  # 候选差值 <10% 才进阶段二精排
     top_n_stage2: int = 3
 

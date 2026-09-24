@@ -4,6 +4,7 @@
 - 文件：logs/app_YYYY-MM-DD.log，全级别，含时间/模块/级别；
 - 脱敏铁律：日志 Filter 在 Formatter 之前把 SESSDATA / bili_jct / buvid3
   的 cookie 值统一替换为 <redacted>，DEBUG 级也不例外（文档 §12）。
+  V5-P2-7：同时覆盖 NAME=value 串与 dict/JSON 引号键值（单双引号）两种形态。
 - F3-4（§9.4/§12）：脱敏同时覆盖普通消息与异常堆栈——record.exc_info
   预先格式化为脱敏后的 exc_text（Formatter 优先复用 exc_text 缓存），
   stack_info 同步脱敏；任何日志/异常堆栈不得输出完整 cookie。
@@ -22,6 +23,15 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 # cookie 名大小写不敏感，值匹配到分号或空白为止（保留结尾分号）
 _COOKIE_RE = re.compile(r"(SESSDATA|bili_jct|buvid3)=([^;\s]+)", re.IGNORECASE)
 
+# V5-P2-7：dict/JSON 形态——{'SESSDATA': 'abc'} 与 {"SESSDATA":"abc"}（含带空格
+# 变体）。分组：\1 cookie 名、\2 键引号（可空）、\3 冒号及两侧空白（原样保留）、
+# \4 值引号（首尾同种）、\5 值。B 站错误响应若回显凭证即为此形态（fav.py 打印
+# 完整 body），仅 NAME=value 串脱敏会漏掉。
+_COOKIE_QUOTED_RE = re.compile(
+    r"(SESSDATA|bili_jct|buvid3)(['\"]?)(\s*:\s*)(['\"])([^'\"]+)\4",
+    re.IGNORECASE,
+)
+
 _DEFAULT_LOG_DIR = _PROJECT_ROOT / "logs"
 _CONSOLE_FORMAT = "%(levelname)s %(message)s"
 _FILE_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -29,7 +39,13 @@ _DATEFMT = "%Y-%m-%d %H:%M:%S"
 
 
 def redact_cookie(text: str) -> str:
-    """把 cookie 值替换为 <redacted>，返回处理后的文本。"""
+    """把 cookie 值替换为 <redacted>，返回处理后的文本。
+
+    覆盖两种形态：NAME=value 串（Cookie 头）与 'NAME'/\"NAME\" 键值（Python
+    dict repr / JSON 响应体，单双引号均匹配）。
+    """
+    # 先处理引号形态（值不含等号，与串形态互不重叠）
+    text = _COOKIE_QUOTED_RE.sub(r"\1\2\3\4<redacted>\4", text)
     return _COOKIE_RE.sub(r"\1=<redacted>", text)
 
 
