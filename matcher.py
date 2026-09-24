@@ -362,8 +362,11 @@ class Matcher:
 
         # ⑤ 两阶段评分 + 置信度准入（MatchGate，文档 §4.2）
         if passed:
+            # F4-3（§7 预防层）：阶段二 view/relation 补查经 rate_limit.stage2
+            # 独立限速（interval + jitter + 并发上限），不再裸发请求
             ranked = await rank_candidates(
-                passed, name, self._config.scoring, self._http, self._db
+                passed, name, self._config.scoring, self._http, self._db,
+                rate_limit=self._config.rate_limit.stage2,
             )
             best = ranked[0]
             score_detail = {

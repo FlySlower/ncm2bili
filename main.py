@@ -1,12 +1,16 @@
-"""CLI 入口（里程碑 M4：run --dry-run 骨架，对应文档 §10.1）。
+"""CLI 入口（v0.4.4：任务制 run/resume/task/report + MATCHED 三阶段，对应文档 §10.1）。
 
 流程：阶段一（网易云抓取）→ 阶段二（状态机匹配，并发按 config）→
-      生成 output/preview_report.html + report.csv。
+      生成 output/preview_report.html + report.csv → 阶段三批量收藏（正式运行）。
 --dry-run 不调用任何收藏夹创建/收藏接口（文档 §10.1）。
 
 中断后可重跑：songs 表中已 DONE / MATCHED / FAV_FAILED 的歌直接跳过，
 不再发搜索请求（文档 §4.4 resume 语义，F2-1）。正式运行匹配成功置
 MATCHED（已匹配待收藏，§4.1），阶段三 fav_one() 成功才逐个置 DONE。
+
+v0.4.4 第四批（F4-1/F4-4）：所有 httpx.AsyncClient 传 config.http.timeout_s；
+BiliSearchClient 传 wbi_ttl_s/retry_delays_s（config 驱动，不硬编码），
+buvid3 持久化到独立注入的 credentials.db。
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ from typing import Any
 import httpx
 
 from auth import run_auth
+from backoff import backoff_delays
 from bili_search import BiliSearchClient
 from circuit_breaker import CircuitBreaker
 from config import Config, load_config
@@ -192,12 +197,13 @@ async def run_dry_run(
 
     done = sum(1 for r in results if r["status"] == "DONE")
     matched = sum(1 for r in results if r["status"] == "MATCHED")
-    manual = sum(1 for r in results if r["status"] == "MANUAL")
+    # F4-5：改名 manual_cnt，消除与 run_dry_run 参数 manual（dict）的变量遮蔽
+    manual_cnt = sum(1 for r in results if r["status"] == "MANUAL")
     stats = {
         "total": len(songs),
         "done": done,
         "matched": matched,
-        "manual": manual,
+        "manual": manual_cnt,
     }
     if dry_run:
         # 文档 §10.1（F2-1）：dry-run 无阶段三，阶段二完成即任务 DONE
@@ -316,7 +322,7 @@ async def run_formal(
     )
     try:
         summary = await fav_songs(
-            fav_client, db, config, fav_songs_list, counts["playlist_name"]
+            fav_client, config, fav_songs_list, counts["playlist_name"]
         )
     except AuthExpiredError:
         raise  # 文档 §9.2：凭证失效有明确语义（提示重新 auth），不被兜底吞掉
@@ -393,14 +399,22 @@ def _run_command(args: argparse.Namespace) -> None:
     # 文档 §7 身份层：启动时随机选一个 UA，全程固定贯穿搜索/阶段二/收藏
     session_headers = _session_headers(config)
     db = Database(_PROJECT_ROOT / "cache.db")
-    ncm = NcmClient(httpx.AsyncClient())
+    # F4-4（§5.2 第 4 条）：buvid3 持久化到 credentials.db（与 wbi key 的
+    # cache.db 职责分离），独立连接注入 BiliSearchClient
+    cred_db = Database(_PROJECT_ROOT / "credentials.db")
+    # F4-1（§7 末句）：timeout/wbi_ttl/retry 全部 config 接线，不得硬编码
+    timeout = httpx.Timeout(config.http.timeout_s)
+    ncm = NcmClient(httpx.AsyncClient(timeout=timeout))
     bili = BiliSearchClient(
-        httpx.AsyncClient(),
+        httpx.AsyncClient(timeout=timeout),
         db=db,
+        cred_db=cred_db,
+        wbi_ttl_s=config.cache.wbi_keys_ttl_s,
+        retry_delays_s=backoff_delays(config.risk_control.retry),
         breaker=CircuitBreaker(config.risk_control.circuit_breaker),  # 文档 §7 响应层 b
         headers=session_headers,
     )
-    http = httpx.AsyncClient(headers=session_headers)
+    http = httpx.AsyncClient(headers=session_headers, timeout=timeout)
 
     async def _main() -> None:
         try:
@@ -458,7 +472,12 @@ def _run_command(args: argparse.Namespace) -> None:
         for path in counts["reports"]:
             print(f"报告已生成: {path}")
 
-    asyncio.run(_main())
+    try:
+        asyncio.run(_main())
+    finally:
+        # F4-4：cache.db 与 credentials.db 两个连接均显式关闭
+        db.close()
+        cred_db.close()
 
 
 def _print_task_summary(row, index: int | None = None) -> None:
@@ -581,15 +600,22 @@ def _task_resume_command(args: argparse.Namespace) -> None:
     config = load_config()
     # 文档 §7 身份层：resume 与 run 同款——启动时随机选 UA 全程固定
     session_headers = _session_headers(config)
-    ncm = NcmClient(httpx.AsyncClient())
+    # F4-4（§5.2 第 4 条）：buvid3 持久化到 credentials.db（同 run 路径）
+    cred_db = Database(_PROJECT_ROOT / "credentials.db")
+    # F4-1（§7 末句）：timeout/wbi_ttl/retry 全部 config 接线，不得硬编码
+    timeout = httpx.Timeout(config.http.timeout_s)
+    ncm = NcmClient(httpx.AsyncClient(timeout=timeout))
     # 文档 §7 响应层 b：resume 与 run 同款注入全局熔断器（-412/-702 触发熔断）
     bili = BiliSearchClient(
-        httpx.AsyncClient(),
+        httpx.AsyncClient(timeout=timeout),
         db=db,
+        cred_db=cred_db,
+        wbi_ttl_s=config.cache.wbi_keys_ttl_s,
+        retry_delays_s=backoff_delays(config.risk_control.retry),
         breaker=CircuitBreaker(config.risk_control.circuit_breaker),
         headers=session_headers,
     )
-    http = httpx.AsyncClient(headers=session_headers)
+    http = httpx.AsyncClient(headers=session_headers, timeout=timeout)
 
     async def _main() -> None:
         try:
@@ -644,7 +670,7 @@ def _task_resume_command(args: argparse.Namespace) -> None:
             )
             try:
                 summary = await fav_songs(
-                    fav_client, db, config, [dict(r) for r in retry_rows],
+                    fav_client, config, [dict(r) for r in retry_rows],
                     counts["playlist_name"],
                 )
             except AuthExpiredError:
@@ -665,7 +691,9 @@ def _task_resume_command(args: argparse.Namespace) -> None:
     try:
         asyncio.run(_main())
     finally:
+        # F4-4：cache.db 与 credentials.db 两个连接均显式关闭
         db.close()
+        cred_db.close()
 
 
 def _load_cookie() -> str:
@@ -686,7 +714,7 @@ def _load_cookie() -> str:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        prog="ncm2bili", description="网易云歌单 → B站收藏夹 转换工具（文档 v0.4 任务制）"
+        prog="ncm2bili", description="网易云歌单 → B站收藏夹 转换工具（文档 v0.4.4 任务制）"
     )
     # 文档 §12：DEBUG 级日志仅 --debug 时开启（cookie 脱敏照常生效）
     parser.add_argument(

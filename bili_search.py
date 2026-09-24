@@ -106,11 +106,15 @@ class BiliSearchClient:
 
     Args:
         client: httpx.AsyncClient 实例（测试用 respx mock）。
-        db: Database 实例，用于 kv_meta 缓存 img_key/sub_key；None 时仅内存缓存。
-        retries: 网络/HTTP 错误重试次数（默认 2，配合指数退避共 3 次尝试）。
+        db: cache.db Database 实例，用于 kv_meta 缓存 img_key/sub_key；
+            None 时仅内存缓存（文档 §5.2：wbi key 落 cache.db）。
+        cred_db: credentials.db Database 实例，buvid3 持久化/复用走 credentials
+            表（F4-4，文档 §5.2 第 4 条）；None 时回退 db（兼容单库注入）。
         retry_delays_s: 单请求指数退避间隔序列（文档 §7 响应层 a）；
-                        默认 2s→4s→8s，与 fav 共用 backoff 语义。
-        wbi_ttl_s: WBI key 缓存 TTL（默认 1 天，文档 §5.2）。
+                        默认 2s→4s→8s，与 fav 共用 backoff 语义。尝试次数由
+                        序列长度推导：初次 + len(delays) 次重试（F4-2：
+                        共 4 次尝试，三档退避全部可达，消除"8s 死档"）。
+        wbi_ttl_s: WBI key 缓存 TTL（默认 1 天，文档 §5.2；F4-1 起由 config 注入）。
         headers: 附加请求头（如 UA），合并到每次请求。
         breaker: 全局熔断器（文档 §7 响应层 b）；None 时熔断关闭。
     """
@@ -120,7 +124,7 @@ class BiliSearchClient:
         client: httpx.AsyncClient,
         db: Database | None = None,
         *,
-        retries: int = 2,
+        cred_db: Database | None = None,
         retry_delays_s: list[float] | None = None,
         wbi_ttl_s: int = 86400,
         headers: dict[str, str] | None = None,
@@ -128,7 +132,9 @@ class BiliSearchClient:
     ) -> None:
         self._client = client
         self._db = db
-        self._retries = retries
+        # F4-4（文档 §5.2 第 4 条）：buvid3 持久化到 credentials.db；未单独
+        # 注入 cred_db 时回退 db（兼容测试/单库调用）
+        self._cred_db = cred_db or db
         # 文档 §7 响应层 a：指数退避间隔（与 fav 相同序列，参数可注入）
         self._retry_delays_s = retry_delays_s or [2.0, 4.0, 8.0]
         self._wbi_ttl_s = wbi_ttl_s
@@ -174,7 +180,10 @@ class BiliSearchClient:
         kwargs.setdefault("headers", self._headers)
         last_status: int | None = None
         last_error: Exception | None = None
-        for attempt in range(self._retries + 1):
+        # F4-2（文档 §7 响应层 a）：尝试次数由退避序列长度推导——初次 +
+        # len(retry_delays_s) 次重试（默认 [2,4,8] → 共 4 次尝试），与收藏侧
+        # attempts=[0.0, *delays] 对齐；修复前 retries=2 只跑 3 次尝试，8s 死档。
+        for attempt in range(len(self._retry_delays_s) + 1):
             if attempt > 0:
                 # 文档 §7 响应层 a：单请求指数退避（2s→4s→8s，与 fav 共用）
                 await sleep_before_retry(self._retry_delays_s[attempt - 1])
@@ -190,7 +199,7 @@ class BiliSearchClient:
             except BiliError as exc:
                 last_error = exc
         raise BiliError(
-            f"请求失败（重试 {self._retries} 次后仍失败）: {url} "
+            f"请求失败（重试 {len(self._retry_delays_s)} 次后仍失败）: {url} "
             f"[最后 HTTP 状态码 {last_status}; 根因 "
             f"{type(last_error).__name__}: {last_error}]"
         ) from last_error
@@ -297,8 +306,10 @@ class BiliSearchClient:
         self._ensure_browser_ua()
 
         # 复用持久化的 buvid3（文档 §5.2：重跑直接复用，不必每次重新获取）
-        if not force and self._db is not None:
-            row = self._db.query_one(
+        # F4-4：持久化位置为 credentials.db（self._cred_db），与 wbi key 的
+        # cache.db（self._db）职责分离
+        if not force and self._cred_db is not None:
+            row = self._cred_db.query_one(
                 "SELECT value FROM credentials WHERE key = ?", (_KV_BUVID3,)
             )
             if row is not None and row["value"]:
@@ -346,10 +357,10 @@ class BiliSearchClient:
         return headers
 
     def _persist_buvid3(self) -> None:
-        """buvid3 成功后持久化到 credentials 表（文档 §5.2 第 4 条）。"""
-        if self._db is None:
+        """buvid3 成功后持久化到 credentials.db 的 credentials 表（F4-4，文档 §5.2 第 4 条）。"""
+        if self._cred_db is None:
             return
-        self._db.execute(
+        self._cred_db.execute(
             "INSERT INTO credentials (key, value, updated_at) VALUES (?, ?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
             "updated_at = excluded.updated_at",

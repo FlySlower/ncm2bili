@@ -197,6 +197,72 @@ async def test_buvid3_reused_from_persisted_db(tmp_path) -> None:
     assert respx.calls == []  # 零请求
 
 
+# ---- F4-4（§5.2 第 4 条）：buvid3 持久化到 credentials.db --------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_buvid3_persisted_to_credentials_db_not_cache_db(tmp_path) -> None:
+    """F4-4：注入独立 cred_db 后，buvid3 落 credentials.db，cache.db 不落 buvid3。
+
+    wbi key 仍存 cache.db（kv_meta），两库职责按文档 §3.1/§5.2 分离。
+    """
+    from db import Database
+
+    cache_db = Database(tmp_path / "cache.db")
+    cred_db = Database(tmp_path / "credentials.db")
+
+    respx.get(SPI_URL).mock(return_value=_spi_response(b_3="CRED-DB-B3"))
+    respx.get(NAV_URL).mock(return_value=httpx.Response(200, json=_nav_response()))
+    respx.get(SEARCH_URL).mock(
+        return_value=httpx.Response(200, json={"code": 0, "data": {"result": []}})
+    )
+
+    client = BiliSearchClient(httpx.AsyncClient(), db=cache_db, cred_db=cred_db)
+    async with client:
+        buvid3 = await client.ensure_buvid3()
+        await client.search_videos("测试")  # 触发 wbi key 落 cache.db
+
+    assert buvid3 == "CRED-DB-B3"
+    # buvid3 在 credentials.db
+    cred_row = cred_db.query_one(
+        "SELECT value FROM credentials WHERE key = 'buvid3'"
+    )
+    assert cred_row is not None and cred_row["value"] == "CRED-DB-B3"
+    # 不在 cache.db
+    assert cache_db.query_one(
+        "SELECT value FROM credentials WHERE key = 'buvid3'"
+    ) is None
+    # wbi key 仍在 cache.db 的 kv_meta
+    wbi_row = cache_db.query_one("SELECT value FROM kv_meta WHERE key = 'wbi_keys'")
+    assert wbi_row is not None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_buvid3_reused_from_credentials_db_zero_spi(tmp_path) -> None:
+    """F4-4 复用：buvid3 已在 credentials.db 时，重跑零 SPI/主页请求。"""
+    from db import Database
+
+    cache_db = Database(tmp_path / "cache.db")
+    cred_db = Database(tmp_path / "credentials.db")
+    cred_db.execute(
+        "INSERT INTO credentials (key, value, updated_at) VALUES (?, ?, ?)",
+        ("buvid3", "CRED-PERSISTED-B3", 123),
+    )
+
+    spi_route = respx.get(SPI_URL).mock(return_value=_spi_response())
+    respx.get(HOME_URL).mock(return_value=_home_response())
+
+    client = BiliSearchClient(httpx.AsyncClient(), db=cache_db, cred_db=cred_db)
+    async with client:
+        buvid3 = await client.ensure_buvid3()
+
+    assert buvid3 == "CRED-PERSISTED-B3"
+    assert spi_route.call_count == 0  # 重跑零 SPI 请求
+    home_calls = [c for c in respx.calls if str(c.request.url).startswith(HOME_URL)]
+    assert home_calls == []  # 同样零主页请求
+
 
 # ---- 验收 3：-403 时刷新 key 并重试一次 ----------------------------
 
@@ -336,7 +402,8 @@ async def test_waf_html_412_counts_toward_breaker() -> None:
         with pytest.raises(BiliError):
             await client.search_videos("测试")
 
-    assert breaker.recent_failures == 3  # 每次 WAF 412（含重试）都计数
+    # F4-2：搜索侧与收藏侧统一为初次 + 3 次重试 = 共 4 次尝试
+    assert breaker.recent_failures == 4  # 每次 WAF 412（含重试）都计数
     assert breaker.is_paused  # 达 warn 阈值 3 次 → 全局暂停
     assert any(s >= 60 for s in sleeps), f"未观察到 60s 全局暂停，sleeps={sleeps}"
 
@@ -381,12 +448,16 @@ async def test_retry_recomputes_wbi_signature(monkeypatch) -> None:
 @pytest.mark.asyncio
 @respx.mock
 async def test_waf_412_backoff_delays_applied(monkeypatch) -> None:
-    """412 路径单请求指数退避 2s→4s 生效（响应层 a；实录曾 ~1s 无效）。"""
+    """F4-2（§7 响应层 a）：搜索侧重试耗尽共 4 次尝试，退避 2s→4s→8s 三档全可达。
+
+    尝试次数按 retry_delays_s 长度推导（初次 + len(delays) 次重试），
+    消除旧实现 retries=2 时"8s 永不使用"的死档；实录曾 ~1s 无效退避。
+    """
     from bili_search import BiliError
 
     respx.get(SPI_URL).mock(return_value=_spi_response())
     respx.get(NAV_URL).mock(return_value=httpx.Response(200, json=_nav_response()))
-    respx.get(SEARCH_URL).mock(
+    search_route = respx.get(SEARCH_URL).mock(
         return_value=httpx.Response(412, text="<html>waf</html>",
                                     headers={"content-type": "text/html"})
     )
@@ -403,7 +474,8 @@ async def test_waf_412_backoff_delays_applied(monkeypatch) -> None:
         with pytest.raises(BiliError):
             await client.search_videos("测试")
 
-    assert sleeps == [2.0, 4.0]  # 3 次尝试间两次退避，间隔序列生效
+    assert search_route.call_count == 4  # 初次 + 3 次重试
+    assert sleeps == [2.0, 4.0, 8.0]  # 三档退避全部可达
 
 
 @pytest.mark.asyncio
