@@ -43,7 +43,6 @@ EXPECTED_DEFAULTS = {
         "duration_bonus": 5,
         "duration_short_penalty": -10,
         "duration_long_penalty": -10,
-        "author_penalty": -15,
         "stage2_diff_threshold": 0.10,
         "top_n_stage2": 3,
     },

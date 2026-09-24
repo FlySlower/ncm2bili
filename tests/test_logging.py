@@ -22,6 +22,41 @@ def test_redact_cookie_all_fields() -> None:
     assert "buvid3=<redacted>" in out
 
 
+def test_redact_cookie_dict_form_single_quote() -> None:
+    """V5-P2-7：Python dict repr（单引号）形态 {'SESSDATA': 'abc123'} 也脱敏。"""
+    out = redact_cookie("{'SESSDATA': 'abc123'}")
+    assert "abc123" not in out
+    assert "SESSDATA" in out and "<redacted>" in out
+
+
+def test_redact_cookie_json_form_double_quote() -> None:
+    """V5-P2-7：JSON 形态（双引号，紧凑/冒号带空格）均脱敏。"""
+    for text in ('{"SESSDATA":"abc123"}', '{"SESSDATA": "abc123"}'):
+        out = redact_cookie(text)
+        assert "abc123" not in out, f"明文泄漏: {out}"
+        assert "<redacted>" in out
+
+
+def test_redact_cookie_json_body_all_fields() -> None:
+    """V5-P2-7：错误响应 body（多字段 JSON，三件套）全部脱敏（fav.py 打印 body 场景）。"""
+    body = (
+        '{"code":-702,"message":"请求过快","cookies":'
+        '{"SESSDATA":"abc-secret","bili_jct":"jct-secret","buvid3":"b3-secret"}}'
+    )
+    out = redact_cookie(body)
+    assert "abc-secret" not in out and "jct-secret" not in out and "b3-secret" not in out
+    assert "SESSDATA" in out and "bili_jct" in out and "buvid3" in out
+    assert out.count("<redacted>") == 3
+
+
+def test_redact_cookie_string_form_not_regressed() -> None:
+    """V5-P2-7：原有 NAME=value 串形态（含结尾分号）不回退。"""
+    assert redact_cookie("SESSDATA=abcdef123456;") == "SESSDATA=<redacted>;"
+    text = "SESSDATA=abc; bili_jct=xyz789;"
+    out = redact_cookie(text)
+    assert out == "SESSDATA=<redacted>; bili_jct=<redacted>;"
+
+
 def test_redact_filter_through_logger() -> None:
     """验收 2：日志含 SESSDATA=abcdef123456; 时输出只能是 SESSDATA=<redacted>;。"""
     logger = logging.getLogger("test.redact")

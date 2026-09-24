@@ -30,7 +30,6 @@ import logging
 import random
 import re
 import time
-
 from typing import Any
 
 from bili_search import BiliError
@@ -367,10 +366,13 @@ class Matcher:
         # ⑤ 两阶段评分 + 置信度准入（MatchGate，文档 §4.2）
         if passed:
             # F4-3（§7 预防层）：阶段二 view/relation 补查经 rate_limit.stage2
-            # 独立限速（interval + jitter + 并发上限），不再裸发请求
+            # 独立限速（interval + jitter + 并发上限），不再裸发请求。
+            # V5-P2-9（§7 响应层 b）：熔断降速倍率经 bili 客户端透传（与搜索
+            # sleep 补偿同源），critical 后 multiplier=0.5，补查间隔翻倍。
             ranked = await rank_candidates(
                 passed, name, self._config.scoring, self._http, self._db,
                 rate_limit=self._config.rate_limit.stage2,
+                concurrency_multiplier=self._bili.concurrency_multiplier,
             )
             best = ranked[0]
             score_detail = {

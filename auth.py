@@ -14,6 +14,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import os
 import sys
 import time
 from contextlib import suppress
@@ -145,6 +146,11 @@ def save_credentials(db: Database, cookie_str: str, key: bytes) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         (CRED_KEY, token, int(time.time())),
     )
+    # V5-P2-6（§9.4）：凭证库落盘后权限收敛 600（仅属主可读写），与 key 文件对齐。
+    # Windows os.chmod 仅控制只读位（POSIX 权限位语义受限），尽力而为；
+    # 失败（如 :memory: 库）不阻断授权流程。
+    with suppress(OSError):
+        os.chmod(db.path, 0o600)
     logger.info("凭证已加密写入 credentials.db（SESSDATA=<redacted>）")
 
 

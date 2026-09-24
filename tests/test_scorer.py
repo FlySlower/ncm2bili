@@ -94,12 +94,16 @@ def test_stage1_duration_boundaries() -> None:
     assert long_ == pytest.approx(normal - 5 - 10)
 
 
-def test_stage1_author_penalty_spam() -> None:
-    """营销号特征（粉丝极少但播放异常高）→ author_penalty -15。"""
+def test_stage1_follower_field_has_no_effect_v5p2_8() -> None:
+    """V5-P2-8：author_penalty 死分支删除——搜索结果带不带 follower 阶段一分数
+    完全一致（follower 仅阶段二补查后用于沉底，不进阶段一公式）。"""
     cfg = Config().scoring
-    spam = _video(follower=10, play=500_000, title="夜曲", duration=240)
+    assert not hasattr(cfg, "author_penalty")  # 配置项已删
+    spam_like = _video(follower=10, play=500_000, title="夜曲", duration=240)
     normal = _video(follower=50_000, play=500_000, title="夜曲", duration=240)
-    assert stage1_score(spam, "夜曲", cfg) == stage1_score(normal, "夜曲", cfg) + cfg.author_penalty
+    no_follower = _video(play=500_000, title="夜曲", duration=240)
+    assert stage1_score(spam_like, "夜曲", cfg) == stage1_score(normal, "夜曲", cfg)
+    assert stage1_score(no_follower, "夜曲", cfg) == stage1_score(normal, "夜曲", cfg)
 
 
 @pytest.mark.asyncio
@@ -179,6 +183,52 @@ async def test_stage2_rate_limit_sleeps_and_follows_config(
         )
         assert len(respx_mock.calls) == 4
         assert sorted(sleeps) == [1.0, 1.0]
+
+
+@pytest.mark.asyncio
+async def test_stage2_breaker_multiplier_lengthens_interval(
+    respx_mock, monkeypatch,
+) -> None:
+    """V5-P2-9（§7 响应层 b）：critical 熔断后 concurrency_multiplier=0.5，
+    阶段二补查（view/relation 统一的一次前置 sleep）间隔翻倍（0.5s → 1.0s），
+    写法对齐 fav.py（base / multiplier）；补查请求照常发出。"""
+    import scorer
+    from config import RateLimitSection
+
+    respx_mock.get(VIEW_URL).mock(return_value=_ok(like=1))
+    respx_mock.get(RELATION_URL).mock(return_value=_ok(follower=1000))
+
+    candidates = [
+        _video(bvid="BV1a", play=1_000, favorites=100, reply=10, title="夜曲 官方版", mid=1),
+        _video(bvid="BV2b", play=980, favorites=98, reply=9, title="夜曲 官方现场", mid=2),
+    ]
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(scorer.asyncio, "sleep", fake_sleep)
+
+    rl = RateLimitSection(concurrency=4, interval_ms=500, jitter_ms=[0, 0])
+    client = httpx.AsyncClient()
+    async with client:
+        # 无熔断（multiplier=1.0）：基准 0.5s
+        await rank_candidates(
+            [dict(c) for c in candidates], "夜曲", Config().scoring, client, None,
+            rate_limit=rl, concurrency_multiplier=1.0,
+        )
+        assert sorted(sleeps) == [0.5, 0.5]
+
+        # critical 熔断（multiplier=0.5）：间隔翻倍到 1.0s
+        sleeps.clear()
+        respx_mock.calls.clear()
+        await rank_candidates(
+            [dict(c) for c in candidates], "夜曲", Config().scoring, client, None,
+            rate_limit=rl, concurrency_multiplier=0.5,
+        )
+        assert sorted(sleeps) == [1.0, 1.0]
+        assert len(respx_mock.calls) == 4  # view/relation 两处补查照常发出
 
 
 @pytest.mark.asyncio

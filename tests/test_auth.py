@@ -148,3 +148,24 @@ def test_credentials_overwrite_on_rerun(tmp_path) -> None:
     row = db.query_one("SELECT value FROM credentials WHERE key = 'bili_cookie'")
     assert row is not None
     assert "new-secret" not in row["value"]  # 密文，无明文
+
+
+def test_save_credentials_chmod_600(tmp_path, monkeypatch) -> None:
+    """V5-P2-6（§9.4）：凭证落盘后对 credentials.db 执行 os.chmod(path, 0o600)。
+
+    Windows os.chmod 的 POSIX 权限位语义受限（仅只读位），用例只断言调用本身：
+    目标路径为 credentials.db、mode 为 0o600。先建密钥再 patch，避免密钥文件的
+    Path.chmod（内部同样走 os.chmod）混入调用记录。
+    """
+    import auth
+
+    db_path = tmp_path / "credentials.db"
+    db = Database(db_path)
+    key = load_or_create_key(tmp_path / "key")  # 先建密钥：其 chmod 不被捕获
+
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(auth.os, "chmod", lambda p, mode: calls.append((p, mode)))
+
+    save_credentials(db, COOKIE_STR, key)
+
+    assert calls == [(db.path, 0o600)]

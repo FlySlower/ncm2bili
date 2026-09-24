@@ -924,3 +924,67 @@ async def test_critical_breaker_halves_fav_request_rate(tmp_path) -> None:
     assert critical_elapsed >= normal_elapsed * 1.5, (
         f"critical 未降速: normal={normal_elapsed:.3f}s critical={critical_elapsed:.3f}s"
     )
+
+
+# ---- V5-P2-11（§4.4/§9.2）：fav_songs gather 显式取消 ------------------
+
+
+@pytest.mark.asyncio
+async def test_fav_songs_cancels_other_workers_when_one_raises() -> None:
+    """V5-P2-11：单个 worker 抛中止类异常（AuthExpiredError）后，其余并发 worker
+    被显式 cancel（对齐 main.py 阶段二的取消写法），而非残留到 asyncio.run 收尾。
+
+    用鸭子类型 stub 客户端：一首抛 AuthExpiredError，另两首阻塞在永不 set 的
+    Event.wait()（可被 cancel 唤醒）。断言这两首都收到 CancelledError。
+    """
+    import asyncio
+
+    cfg = Config()
+    cfg.rate_limit.fav.concurrency = 3  # 三首同时在跑，确保取消时有在途 worker
+    cfg.rate_limit.fav.interval_ms = 0
+    cfg.rate_limit.fav.jitter_ms = [0, 0]
+
+    class _StubFavClient:
+        slowdown_multiplier = 1.0
+        concurrency_multiplier = 1.0
+
+        def __init__(self) -> None:
+            self.entered = 0
+            self.cancelled: list[str] = []
+            # 三首全部进入 fav_one 后放行抛异常的 worker（Event 屏障，非忙等）
+            self._all_entered = asyncio.Event()
+
+        def matched_song_ordinals(self, task_id: str) -> dict[str, int]:
+            return {"k0": 0, "k1": 1, "k2": 2}
+
+        async def ensure_folders(self, name: str, total: int) -> list[int]:
+            return [1]
+
+        async def fav_one(self, media_id: int, song: dict) -> dict:
+            key = song["song_key"]
+            self.entered += 1
+            if self.entered == 3:
+                self._all_entered.set()
+            if key == "k1":
+                # 等三个 worker 都进入 fav_one 后再抛，确保另两首已在途阻塞
+                await self._all_entered.wait()
+                raise AuthExpiredError("凭证失效（测试 stub）")
+            try:
+                await asyncio.Event().wait()  # 永不结束，等待被取消
+            except asyncio.CancelledError:
+                self.cancelled.append(key)
+                raise
+            return {"status": "DONE"}
+
+    songs = [
+        {"song_key": f"k{i}", "name": f"歌{i}", "artist": "艺",
+         "task_id": "t", "bvid": f"BV{i}"}
+        for i in range(3)
+    ]
+
+    stub = _StubFavClient()
+    with pytest.raises(AuthExpiredError):
+        await fav_songs(stub, cfg, songs, "歌单", media_ids=[1])
+
+    # 其余两首在途 worker 必须被显式取消（修复前裸 gather 时本列表为空）
+    assert set(stub.cancelled) == {"k0", "k2"}
