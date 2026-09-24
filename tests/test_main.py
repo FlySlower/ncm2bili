@@ -1400,3 +1400,127 @@ def test_resume_clients_wired_from_config(respx_mock, tmp_path, monkeypatch) -> 
     # 已 DONE 的歌零搜索（接线验证不依赖副作用，顺带守住 resume 跳过语义）
     search_calls = [c for c in respx_mock.calls if "search/type" in str(c.request.url)]
     assert search_calls == []
+
+
+# ---- V5-P0-2（§4.1 人工回灌永远覆盖）：四状态端到端 -------------------
+
+
+def test_resume_manual_override_covers_four_statuses(
+    respx_mock, tmp_path, monkeypatch,
+) -> None:
+    """V5-P0-2 验收（§4.1 铁律）：manual.json 回灌新 BV 后 resume——
+
+    DONE / MATCHED / FAV_FAILED / MANUAL 四种起始状态的歌，人工回灌的新 BV 一致
+    生效：阶段二不搜索（DONE/MATCHED/FAV_FAILED 跳过；MANUAL 经 matcher 取
+    manual BV），阶段三收藏的是新 BV（而非库内旧 bvid）。
+
+    修复前：SQL 只查 status='DONE'，FAV_FAILED/MATCHED 的人工回灌静默失效，
+    且 resume 阶段三收藏库内旧 bvid（错误内容）。
+    """
+    import main as main_mod
+    from main import main
+
+    monkeypatch.setattr(main_mod, "_PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("main._load_cookie", lambda: COOKIE)
+
+    # 屏蔽收藏限速的真实 sleep（4 首串行 4s+ 太慢）
+    async def _fake_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    # 4 首歌的歌单（歌1~歌4）
+    four_songs = SONGS[:4]
+    track_ids = [{"id": s["id"]} for s in four_songs]
+    respx_mock.get(PLAYLIST_URL).mock(
+        return_value=httpx.Response(
+            200, json={"code": 200, "playlist": {"trackIds": track_ids, "name": "歌单1"}}
+        )
+    )
+    respx_mock.post(SONG_DETAIL_URL).mock(
+        return_value=httpx.Response(200, json={"code": 200, "songs": four_songs})
+    )
+    _mock_bili_env(respx_mock)
+    # 搜索不应被调用（四状态全有 BV 或 manual 覆盖，无需搜索）
+    respx_mock.get(SEARCH_URL).mock(return_value=_ok(result=[]))
+
+    _mock_fav_folders(respx_mock, existing=[{"id": 777, "title": "歌单1 (1)"}])
+    respx_mock.post(FAV_RESOURCE_URL).mock(
+        return_value=httpx.Response(200, json={"code": 0})
+    )
+
+    # bvid→aid 转换：捕获请求的 bvid 参数，断言是 NEW BV 而非 OLD。
+    # 注意：必须在 _mock_fav_folders 之后注册——后者内部对 VIEW_URL 注册了
+    # 静态 mock，后注册的 side_effect 才能覆盖它并捕获参数。
+    view_bvids: list[str] = []
+
+    def view_handler(request: httpx.Request) -> httpx.Response:
+        view_bvids.append(request.url.params.get("bvid", ""))
+        return httpx.Response(200, json={"code": 0, "data": {"aid": 753394975}})
+
+    respx_mock.get(VIEW_URL).mock(side_effect=view_handler)
+
+    # 预置：RUNNING 任务 + 四首歌各带不同状态与 OLD BV
+    db = Database(tmp_path / "cache.db")
+    tid = db.create_task(123)
+    db.upsert_song(
+        "歌1|艺1", task_id=tid, ncm_id=1, name="歌1", artist="艺1",
+        status="DONE", method="SCORED", bvid="BV1OLD",
+    )
+    db.upsert_song(
+        "歌2|艺2", task_id=tid, ncm_id=2, name="歌2", artist="艺2",
+        status="MATCHED", method="SCORED", bvid="BV2OLD",
+    )
+    db.upsert_song(
+        "歌3|艺3", task_id=tid, ncm_id=3, name="歌3", artist="艺3",
+        status="FAV_FAILED", method="SCORED", bvid="BV3OLD",
+        fail_reason="收藏失败（code -403）",
+    )
+    db.upsert_song(
+        "歌4|艺4", task_id=tid, ncm_id=4, name="歌4", artist="艺4",
+        status="MANUAL", method="MANUAL", bvid=None,
+        fail_reason="降级链全部未命中",
+    )
+    db.close()
+
+    # 人工回灌：manual.json 写入四首歌的 NEW BV
+    import json as _json
+    manual_data = {
+        "歌1|艺1": "BV1NEW",
+        "歌2|艺2": "BV2NEW",
+        "歌3|艺3": "BV3NEW",
+        "歌4|艺4": "BV4NEW",
+    }
+    (tmp_path / "manual.json").write_text(
+        _json.dumps(manual_data, ensure_ascii=False), encoding="utf-8"
+    )
+
+    main(["task", "resume", tid, "--yes"])
+
+    # 阶段三收藏的是 NEW BV（view 请求的 bvid 参数全部为 NEW）
+    assert sorted(view_bvids) == ["BV1NEW", "BV2NEW", "BV3NEW", "BV4NEW"], (
+        f"阶段三应收藏新 BV，实际 view 请求 bvid: {view_bvids}"
+    )
+    # 无旧 BV 被收藏
+    assert "BV1OLD" not in view_bvids
+    assert "BV2OLD" not in view_bvids
+    assert "BV3OLD" not in view_bvids
+
+    # 零搜索请求
+    search_calls = [c for c in respx_mock.calls if "search/type" in str(c.request.url)]
+    assert search_calls == []
+
+    # 四首歌全部 DONE，bvid 为 NEW BV
+    db = Database(tmp_path / "cache.db")
+    rows = {
+        r["song_key"]: r for r in db.query(
+            "SELECT song_key, status, bvid, fail_reason FROM songs WHERE task_id = ?",
+            (tid,),
+        )
+    }
+    for key, new_bv in [("歌1|艺1", "BV1NEW"), ("歌2|艺2", "BV2NEW"),
+                        ("歌3|艺3", "BV3NEW"), ("歌4|艺4", "BV4NEW")]:
+        assert rows[key]["status"] == "DONE", f"{key} 应 DONE，实际 {rows[key]['status']}"
+        assert rows[key]["bvid"] == new_bv, f"{key} bvid 应为 {new_bv}"
+        assert rows[key]["fail_reason"] is None, f"{key} fail_reason 应清空"
+    db.close()

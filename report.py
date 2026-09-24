@@ -298,8 +298,12 @@ def write_review_html(
     F1-4（§10.3）：song_key 经 data-* 属性 + 事件委托传递，废除 onclick 拼接；
     token 注入页面 JS 供 fetch 携带 X-Token 头。
 
+    V5-P2-10（§10.2 连带回归修复）：过滤仅按 status 判定——删除原
+    `or method=='MANUAL'` 分支（F2-1 引入"升级后保留 method=MANUAL"后，
+    DONE+MANUAL / MATCHED+MANUAL 的歌误列入待 review 列表）。
+
     Args:
-        rows: songs 表行；仅 status=MANUAL / FAV_FAILED（或 method=MANUAL）的歌曲进入列表，
+        rows: songs 表行；仅 status=MANUAL / FAV_FAILED 的歌曲进入列表，
               FAV_FAILED 行内展示收藏失败原因（文档 §10.2）。
         save_url: 保存服务地址（如 http://127.0.0.1:8080/save）；
                   None 时页面提示"服务未启动"。
@@ -314,7 +318,6 @@ def write_review_html(
 
     manual_rows = [
         r for r in rows if (r.get("status") or "MANUAL") in ("MANUAL", "FAV_FAILED")
-        or (r.get("method") or "MANUAL") == "MANUAL"
     ]
 
     body_parts: list[str] = []

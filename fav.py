@@ -311,17 +311,22 @@ class BiliFavClient:
         return int(data["data"]["id"])
 
     def matched_song_ordinals(self, task_id: str) -> dict[str, int]:
-        """F1-3（§5.3）/F4-5：按 song_key 排序查询任务全部已匹配歌曲，
+        """V5-P1-4（§5.3）/F4-5：按 ordinal 排序查询任务全部已匹配歌曲，
         返回 {song_key: ordinal} 稳定分段映射（供 fav_songs 按序连续分段）。
 
-        并发下歌曲插入序不确定，须显式按 song_key 排序保证同一首歌恒进原夹。
+        V5-P1-4：ordinal 持久化在 songs 表（阶段一按歌单顺序分配 0..N-1），
+        替代旧 song_key 字典序排序——保证"第 1~900 首进夹 1"的歌单语义，
+        且回灌增长后原歌 ordinal 不变、不漂移到别的夹。NULL 时兜底用行序号。
         """
         rows = self._db.query(
-            "SELECT song_key FROM songs WHERE task_id = ? AND bvid IS NOT NULL "
-            "AND status IN ('DONE','MATCHED','FAV_FAILED') ORDER BY song_key",
+            "SELECT song_key, ordinal FROM songs WHERE task_id = ? AND bvid IS NOT NULL "
+            "AND status IN ('DONE','MATCHED','FAV_FAILED') ORDER BY ordinal",
             (task_id,),
         )
-        return {r["song_key"]: i for i, r in enumerate(rows)}
+        return {
+            r["song_key"]: r["ordinal"] if r["ordinal"] is not None else i
+            for i, r in enumerate(rows)
+        }
 
     async def ensure_folders(self, playlist_name: str, total: int) -> list[int]:
         """按 900/夹拆分并确保收藏夹存在，返回各夹 media_id 列表。
@@ -460,9 +465,10 @@ async def fav_songs(
 ) -> dict:
     """批量收藏（文档 §7 收藏参数 + §5.3 按序连续分段）。
 
-    F1-3（§5.3）：收藏夹分配改按序连续分段（第 i 首进夹 ⌊i/per_folder_limit⌋），
-    禁止轮转；resume 建夹数量按任务总匹配数计算，保证歌进原夹。断点映射按
-    song_key 排序定序（并发插入序不确定，须显式排序稳定映射）。
+    F1-3/V5-P1-4（§5.3）：收藏夹分配按 ordinal 连续分段（第 i 首进夹
+    ⌊ordinal/per_folder_limit⌋），禁止轮转；resume 建夹数量按任务总匹配数
+    计算，保证歌进原夹。ordinal 持久化在 songs 表（阶段一按歌单顺序分配），
+    回灌增长后原歌 ordinal 不变、不漂移到别的夹。
 
     F4-5：去掉死参数 db——ordinal 映射经 client.matched_song_ordinals() 公开
     方法读取，降速倍率经 client.slowdown_multiplier 公开属性读取。
@@ -476,8 +482,9 @@ async def fav_songs(
     per_folder_limit = config.fav.per_folder_limit
     task_id = songs[0].get("task_id") or "default"
 
-    # F1-3（§5.3）：按 song_key 排序查询全任务匹配数，建立稳定 ordinal 映射。
-    # 并发下 songs 插入序不确定，须显式排序保证断点映射稳定（同一首歌恒进原夹）。
+    # F1-3/V5-P1-4（§5.3）：按 ordinal 查询全任务匹配数，建立稳定分段映射。
+    # ordinal 持久化在 songs 表（阶段一按歌单顺序分配），回灌增长后原歌 ordinal
+    # 不变、不漂移到别的夹；NULL 时兜底用行序号（老库迁移后已有兜底值）。
     ordinal = client.matched_song_ordinals(task_id)
     total_matched = len(ordinal)
 

@@ -1,7 +1,7 @@
 """SQLite 封装（里程碑 M0，v0.4 任务制）。
 
-严格按文档 §6 的 DDL 建 7 张表：songs（带 task_id）/ tasks / search_cache /
-uploader_cache / whitelist_bv / credentials / kv_meta。
+严格按文档 §6 的 DDL 建 7 张表：songs（带 task_id + ordinal）/ tasks /
+search_cache / uploader_cache / whitelist_bv / credentials / kv_meta。
 
 设计要点：
 - 任务制（文档 §4.4）：每次 run 生成唯一 task_id，songs 以 (song_key, task_id)
@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS songs (
   bvid         TEXT,
   score_detail TEXT,               -- 评分明细 JSON（抽查调权重用）
   fail_reason  TEXT,
+  ordinal      INTEGER,            -- V5-P1-4（§5.3）：歌单内序号 0..N-1，持久化保证分段与 resume 按 ordinal 排序
   updated_at   INTEGER,
   PRIMARY KEY (song_key, task_id)
 );
@@ -122,6 +123,11 @@ class Database:
         无 MATCHED 语义）songs 全部 DONE 行一次性转 MATCHED，交阶段三重新
         收藏——deal 对已收藏返回 code 0 幂等，宁可重复收藏、不可漏收藏。
         经 kv_meta 标记保证仅执行一次：此后 fav_one() 写入的 DONE 不再被翻转。
+
+        v0.4.5 迁移（V5-P1-4，§5.3）：songs 表加 ordinal 列——持久化歌单顺序，
+        分段序与 resume 重映射按 ordinal 而非 song_key 字典序。老库（无 ordinal 列）
+        兜底赋序：按 task_id 分组、song_key 排序赋 0..N-1（与旧 song_key 排序行为
+        一致，不改变已有分段归属）。
         """
         cols = [r["name"] for r in self.query("PRAGMA table_info(songs)")]
         if "task_id" not in cols:
@@ -143,6 +149,7 @@ class Database:
                       bvid         TEXT,
                       score_detail TEXT,
                       fail_reason  TEXT,
+                      ordinal      INTEGER,
                       updated_at   INTEGER,
                       PRIMARY KEY (song_key, task_id)
                     );
@@ -155,6 +162,7 @@ class Database:
                     DROP TABLE songs_legacy;
                     """
                 )
+            cols = [r["name"] for r in self.query("PRAGMA table_info(songs)")]
         # 统一补建 task_id 索引（任务查询/删除走该列）
         self.execute("CREATE INDEX IF NOT EXISTS idx_songs_task_id ON songs (task_id)")
         # F2-1（§4.4/§6）：老库全 DONE → MATCHED，一次性（kv_meta 标记防重复迁移）
@@ -168,6 +176,28 @@ class Database:
                 "VALUES ('migrated_done_to_matched_v044', '1', ?)",
                 (int(time.time()),),
             )
+        # V5-P1-4（§5.3）：songs 表加 ordinal 列——持久化歌单顺序，分段序与
+        # resume 重映射按 ordinal 而非 song_key 字典序。老库兜底赋序。
+        if "ordinal" not in cols:
+            self.execute("ALTER TABLE songs ADD COLUMN ordinal INTEGER")
+        # 兜底赋序：对 ordinal 为 NULL 的行，按 task_id 分组、song_key 排序赋 0..N-1
+        # （与旧 song_key 排序行为一致，不改变已有分段归属；新数据由阶段一按歌单
+        # 顺序赋 ordinal，覆盖此兜底值）
+        null_tasks = self.query(
+            "SELECT DISTINCT task_id FROM songs WHERE ordinal IS NULL"
+        )
+        for task in null_tasks:
+            tid = task["task_id"]
+            rows = self.query(
+                "SELECT song_key FROM songs WHERE task_id = ? AND ordinal IS NULL "
+                "ORDER BY song_key",
+                (tid,),
+            )
+            for i, row in enumerate(rows):
+                self.execute(
+                    "UPDATE songs SET ordinal = ? WHERE song_key = ? AND task_id = ?",
+                    (i, row["song_key"], tid),
+                )
 
     # ---- 基础封装 -------------------------------------------------
 

@@ -123,13 +123,16 @@ async def run_dry_run(
             (task_id,),
         )
 
-    # 文档 §4.1 优先级重查（F2-1）：已 DONE 的歌若 manual.json 新增了对应 BV 且
-    # 与现有不同，升级为人工结果交阶段三收藏新 BV——正式运行置 MATCHED（已匹
-    # 配待收藏）；dry-run 无阶段三，保持 DONE（仅更新 bvid/method）。不发任何
-    # 网络请求。
+    # 文档 §4.1 优先级重查（F2-1/V5-P0-2）：人工回灌永远覆盖——
+    # DONE / MATCHED / FAV_FAILED 的歌若 manual.json 新增了对应 BV 且与现有不同，
+    # 升级为人工结果交阶段三收藏新 BV。正式运行置 MATCHED（已匹配待收藏）；
+    # dry-run 无阶段三，保持 DONE（仅更新 bvid/method）。不发任何网络请求。
+    # V5-P0-2：原查询只查 status='DONE'，FAV_FAILED / MATCHED 的人工回灌静默失效
+    # （且 resume 阶段三会收藏库内旧 bvid，比"不生效"更糟）。扩为三种状态一致生效。
     if manual:
         rows = db.query(
-            "SELECT song_key, bvid FROM songs WHERE status = 'DONE' AND task_id = ?",
+            "SELECT song_key, bvid FROM songs "
+            "WHERE status IN ('DONE', 'MATCHED', 'FAV_FAILED') AND task_id = ?",
             (task_id,),
         )
         upgraded_status = "DONE" if dry_run else "MATCHED"
@@ -146,6 +149,11 @@ async def run_dry_run(
     # 阶段一：网易云抓取（文档 §5.1）
     track_ids = await ncm.fetch_playlist_track_ids(playlist_id)
     songs = await ncm.fetch_song_details(track_ids)
+    # V5-P1-4（§5.3）：按歌单顺序分配 ordinal 0..N-1，持久化到 songs 表。
+    # 分段序与 resume 重映射按 ordinal 而非 song_key 字典序，保证"第 1~900 首
+    # 进夹 1"的歌单语义；ordinal 恒定，回灌增长后原歌不漂移到别的夹。
+    for _i, _song in enumerate(songs):
+        _song["ordinal"] = _i
 
     matcher = Matcher(
         config,
@@ -342,7 +350,12 @@ async def run_formal(
 
 
 def _report_command(args: argparse.Namespace) -> None:
-    """report 命令：生成 review.html（MANUAL 歌曲回灌页），可选拉起本地保存服务。"""
+    """report 命令：生成 review.html（MANUAL 歌曲回灌页），可选拉起本地保存服务。
+
+    V5-P0-1（§10.3 意图）：--serve 时 review_server 同时托管 review.html 页面，
+    打印完整页面 URL（http://127.0.0.1:<port>/review.html?token=<token>），
+    用户从浏览器打开即同源，POST 的 Origin 校验安全意图完整保留。
+    """
     db = Database(_PROJECT_ROOT / "cache.db")
     try:
         if args.task_id:
@@ -355,22 +368,26 @@ def _report_command(args: argparse.Namespace) -> None:
 
         save_url: str | None = None
         token = ""
+        review_html_path = _PROJECT_ROOT / "output" / "review.html"
         if args.serve:
             from review_server import serve_in_background
 
             server, port, token = serve_in_background(
-                _PROJECT_ROOT / "manual.json", db=db
+                _PROJECT_ROOT / "manual.json", db=db,
+                review_html_path=review_html_path,
             )
             save_url = f"http://127.0.0.1:{port}/save"
             print(f"本地保存服务已启动：{save_url}（Ctrl+C 停止）")
 
-        html_path = write_review_html(
-            rows, _PROJECT_ROOT / "output" / "review.html",
+        write_review_html(
+            rows, review_html_path,
             save_url=save_url, token=token,
         )
-        print(f"review.html 已生成: {html_path}")
+        print(f"review.html 已生成: {review_html_path}")
 
         if args.serve:
+            page_url = f"http://127.0.0.1:{port}/review.html?token={token}"
+            print(f"在浏览器打开：{page_url}")
             try:
                 server.serve_forever()
             except KeyboardInterrupt:

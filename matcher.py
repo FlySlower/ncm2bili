@@ -89,11 +89,14 @@ def _normalize(text: str) -> str:
     """标题/歌名归一化（文档 §4.2 token 匹配与 §4.4 归属校验共用）。
 
     去 HTML 标签（B 站搜索结果标题含 <em class="keyword"> 高亮）、实体解码、
-    去标点（保留 CJK 与 ASCII 字母数字）、字母小写、空白折叠。
+    标点替换为空格（V5-P1-3：原直接删除导致 token 粘连——`单车(Live)` 归一为
+    `单车live` 单 token，标题含空格时子串判定 False 误杀；改为替换空格后
+    `单车 live` → tokens ['单车','live']，正确匹配带版本括号的歌名）、
+    字母小写、空白折叠。
     """
     t = re.sub(r"<[^>]*>", "", text)
     t = html.unescape(t)
-    t = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff\s]", "", t)
+    t = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff\s]", " ", t)
     return re.sub(r"\s+", " ", t).strip().lower()
 
 
@@ -252,6 +255,7 @@ class Matcher:
             alia=json.dumps(song.get("alia") or [], ensure_ascii=False),
             origin=json.dumps(song.get("origin") or {}, ensure_ascii=False),
             status="PENDING",
+            ordinal=song.get("ordinal"),  # V5-P1-4（§5.3）：歌单内序号，阶段一分配
         )
 
         # 优先级铁律（文档 §4.1）：manual > whitelist（来源：whitelist_bv 表）

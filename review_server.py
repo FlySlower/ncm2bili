@@ -77,14 +77,24 @@ def update_manual(path: str | Path, song_key: str, bvid: str) -> dict:
 
 
 class ReviewHandler(BaseHTTPRequestHandler):
-    """POST /save 处理器；manual_path、db、token 由 start_review_server 注入。"""
+    """POST /save + GET /review.html 处理器；manual_path、db、token、
+    review_html_path 由 start_review_server 注入。
+
+    V5-P0-1（§10.3 意图）：review_server 托管 review.html 页面本身——
+    用户从浏览器打开 http://127.0.0.1:<port>/review.html?token=<token> 即同源，
+    POST 的 Origin 校验安全意图完整保留，file:// 跨源 403/501 阻断同时消失。
+    """
 
     manual_path: Path = Path(_MANUAL_FILENAME)
     db: Any = None  # 可选：同步写 whitelist_bv 表（source=manual，文档 §6）
     token: str = ""  # F1-4（§10.3）：一次性 token，由 start_review_server 注入
+    review_html_path: Path | None = None  # V5-P0-1：托管的 review.html 路径
     server_version = "review-server/1.0"
 
-    # ---- 路由 -----------------------------------------------------
+    def _expected_origin(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    # ---- POST /save：保存 BV 到 manual.json（文档 §10.3）----------------
 
     def do_POST(self) -> None:  # noqa: N802 - http.server 协议方法名
         if self.path != "/save":
@@ -93,8 +103,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
         # F1-4（§10.3）：Origin 同源校验（仅接受 http://127.0.0.1:<port>）
         origin = self.headers.get("Origin", "")
-        expected_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
-        if origin != expected_origin:
+        if origin != self._expected_origin():
             self._reply(403, {"error": "forbidden origin"})
             return
 
@@ -132,8 +141,46 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.db.upsert_whitelist_bv(song_key, bvid, source="manual")
         self._reply(200, {"ok": True})
 
+    # ---- GET /review.html：托管页面（V5-P0-1，§10.3 意图）----------------
+    # 页面 URL 带 token 查询参数（与 POST 的 X-Token 校验同一套 token），
+    # 用户从浏览器打开即同源，file:// 的 Origin:null / 无 Origin / OPTIONS
+    # 三个 403/501 阻断同时消除。
+
     def do_GET(self) -> None:  # noqa: N802
-        self._reply(404, {"error": "not found"})
+        from urllib.parse import urlparse, parse_qs
+
+        parsed = urlparse(self.path)
+        if parsed.path != "/review.html":
+            self._reply(404, {"error": "not found"})
+            return
+
+        # V5-P0-1（§10.3）：token 查询参数校验（与 POST X-Token 同一 token）
+        params = parse_qs(parsed.query)
+        token_param = params.get("token", [""])[0]
+        if not token_param or token_param != self.token:
+            self._reply(403, {"error": "invalid token"})
+            return
+
+        if self.review_html_path is None or not self.review_html_path.exists():
+            self._reply(404, {"error": "review.html not found"})
+            return
+
+        data = self.review_html_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    # ---- OPTIONS：CORS 预检（V5-P0-1，同源限定）-------------------------
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        """CORS 预检：仅同源放行（file:// 跨源不返回 Access-Control 头）。"""
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", self._expected_origin())
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Token")
+        self.end_headers()
 
     def log_message(self, fmt: str, *args) -> None:  # noqa: A002 - http.server 签名
         """静默访问日志（仅回环本地工具，无需输出）。"""
@@ -155,11 +202,14 @@ def start_review_server(
     host: str = _HOST,
     port: int = 0,
     db: Any = None,
+    review_html_path: str | Path | None = None,
 ) -> tuple[ThreadingHTTPServer, int, str]:
     """启动本地保存服务，返回 (server, 实际端口, 一次性 token)。
 
     port=0 → 随机端口（文档 §10.3）。仅监听 host（默认 127.0.0.1）。
     db: 可选 Database 实例，保存时同步写 whitelist_bv 表（source=manual）。
+    review_html_path: V5-P0-1（§10.3 意图）——托管的 review.html 路径；
+        GET /review.html?token=<token> 返回该文件内容。None 时不托管页面。
     F1-4（§10.3）：启动时生成一次性 token 注入 handler，返回供页面嵌入。
     调用方负责 server.shutdown() / server.server_close()。
     """
@@ -167,7 +217,12 @@ def start_review_server(
     handler = type(
         "BoundReviewHandler",
         (ReviewHandler,),
-        {"manual_path": Path(manual_path), "db": db, "token": token},
+        {
+            "manual_path": Path(manual_path),
+            "db": db,
+            "token": token,
+            "review_html_path": Path(review_html_path) if review_html_path else None,
+        },
     )
     server = ThreadingHTTPServer((host, port), handler)
     return server, server.server_address[1], token
@@ -179,10 +234,12 @@ def serve_in_background(
     host: str = _HOST,
     port: int = 0,
     db: Any = None,
+    review_html_path: str | Path | None = None,
 ) -> tuple[ThreadingHTTPServer, int, str]:
     """后台线程启动服务（测试/命令行用），返回 (server, 实际端口, token)。"""
     server, actual_port, token = start_review_server(
-        manual_path, host=host, port=port, db=db
+        manual_path, host=host, port=port, db=db,
+        review_html_path=review_html_path,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
