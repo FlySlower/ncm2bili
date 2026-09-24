@@ -203,17 +203,25 @@ class Database:
         Args:
             song_key: "歌名|歌手"。
             fields: 任意可更新字段（task_id/ncm_id/name/artist/status/method/
-                    bvid/...），None 值的字段跳过，不覆盖已有数据。
-                    fail_reason 除外：None 也写入（置 NULL），用于转 DONE 清因。
-                    未传 task_id 时默认 'default'（兼容非任务制调用）。
+                    bvid/...）。
+                - 普通字段未传或传 None：跳过，不覆盖已有数据；
+                - 清空类字段白名单（F3-2，文档 §4.2/§6）：bvid / score_detail /
+                  fail_reason 只要被显式传入（即使为 None）就写 NULL——
+                  MatchGate 不采纳与 MANUAL 落库路径显式传 bvid=None，
+                  禁止沿用上一轮残留 bvid/评分明细；未传 task_id 时默认
+                  'default'（兼容非任务制调用）。
+                - 文档 §6 状态跃迁约束：任何路径转 DONE 时 fail_reason 强制
+                  置 NULL（成功与失败原因互斥）。
         """
         task_id = fields.pop("task_id", "default")
+        # F3-2（§4.2/§6）：清空类字段白名单——显式传入即写入（含 None→NULL）
+        nullable_fields = {"bvid", "score_detail", "fail_reason"}
         # 文档 §6 状态跃迁约束：任何路径转 DONE 时 fail_reason 必须置 NULL
         #（成功与失败原因互斥，禁止共存），历史失败原因一并清空。
         if fields.get("status") == "DONE":
             fields["fail_reason"] = None
         values: dict[str, Any] = {
-            k: v for k, v in fields.items() if v is not None or k == "fail_reason"
+            k: v for k, v in fields.items() if v is not None or k in nullable_fields
         }
         values["song_key"] = song_key
         values["task_id"] = task_id
@@ -314,6 +322,27 @@ class Database:
             "ON CONFLICT(song_key) DO UPDATE SET bvid = excluded.bvid, source = excluded.source",
             (song_key, bvid, source),
         )
+
+    def replace_priority_map(self, source: str, items: dict[str, str]) -> None:
+        """F3-1（文档 §4.4/§6）：按 source 全量重建 whitelist_bv——
+        先 DELETE 该 source 的全部行，再批量 upsert；json 中删除的条目在表中
+        同步删除（防止已删白名单残留生效）。DELETE+INSERT 包在同一事务内，
+        不存在"删完未写"的中间态。
+
+        注意 whitelist_bv 以 song_key 为单列主键（manual/whitelist 同键冲突时
+        一行只存一个 source）：调用方须按 whitelist → manual 顺序重建，
+        manual 后写覆盖同键行（与"manual 优先级最高"一致，见 Matcher.__init__）。
+        """
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM whitelist_bv WHERE source = ?", (source,)
+            )
+            self._conn.executemany(
+                "INSERT INTO whitelist_bv (song_key, bvid, source) VALUES (?, ?, ?) "
+                "ON CONFLICT(song_key) DO UPDATE SET bvid = excluded.bvid, "
+                "source = excluded.source",
+                [(key, bvid, source) for key, bvid in items.items()],
+            )
 
     def load_priority_map(self, source: str) -> dict[str, str]:
         """按 source（whitelist/manual）读取 {song_key: bvid}。"""

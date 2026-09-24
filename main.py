@@ -32,7 +32,13 @@ from report import write_reports, write_review_html
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_OUTPUT_DIR = Path("output")
+# F3-5（文档 §11.4）：路径基准——所有数据文件（cache.db / credentials.db /
+# whitelist.json / uploaders.json / blacklist_words.json / manual.json /
+# output / logs）均基于项目根解析，与 CWD 无关：任意目录下执行
+# `python main.py ...` 行为一致。测试可 monkeypatch 本变量重定向到临时目录。
+_PROJECT_ROOT = Path(__file__).resolve().parent
+
+_DEFAULT_OUTPUT_DIR = _PROJECT_ROOT / "output"
 
 
 def _session_headers(config: Config) -> dict[str, str]:
@@ -90,13 +96,13 @@ async def run_dry_run(
                  阶段三完成后，由 run_formal / resume 置 DONE。
     """
     if whitelist is None:
-        whitelist = _load_json("whitelist.json", {})
+        whitelist = _load_json(_PROJECT_ROOT / "whitelist.json", {})
     if uploaders is None:
-        uploaders = _load_json("uploaders.json", {})
+        uploaders = _load_json(_PROJECT_ROOT / "uploaders.json", {})
     if blacklist_words is None:
-        blacklist_words = _load_json("blacklist_words.json", [])
+        blacklist_words = _load_json(_PROJECT_ROOT / "blacklist_words.json", [])
     if manual is None:
-        manual = _load_json("manual.json", {})
+        manual = _load_json(_PROJECT_ROOT / "manual.json", {})
 
     # 文档 §4.4 任务制：无 task_id 时创建新任务；否则沿用传入任务（resume）
     if task_id is None:
@@ -331,7 +337,7 @@ async def run_formal(
 
 def _report_command(args: argparse.Namespace) -> None:
     """report 命令：生成 review.html（MANUAL 歌曲回灌页），可选拉起本地保存服务。"""
-    db = Database("cache.db")
+    db = Database(_PROJECT_ROOT / "cache.db")
     try:
         if args.task_id:
             rows = db.query(
@@ -346,12 +352,14 @@ def _report_command(args: argparse.Namespace) -> None:
         if args.serve:
             from review_server import serve_in_background
 
-            server, port, token = serve_in_background("manual.json", db=db)
+            server, port, token = serve_in_background(
+                _PROJECT_ROOT / "manual.json", db=db
+            )
             save_url = f"http://127.0.0.1:{port}/save"
             print(f"本地保存服务已启动：{save_url}（Ctrl+C 停止）")
 
         html_path = write_review_html(
-            rows, _DEFAULT_OUTPUT_DIR / "review.html",
+            rows, _PROJECT_ROOT / "output" / "review.html",
             save_url=save_url, token=token,
         )
         print(f"review.html 已生成: {html_path}")
@@ -370,7 +378,7 @@ def _report_command(args: argparse.Namespace) -> None:
 
 def _auth_command(args: argparse.Namespace) -> None:
     """auth 命令：playwright 浏览器授权，或 --paste 手动粘贴回退（文档 §11.3）。"""
-    db = Database("credentials.db")
+    db = Database(_PROJECT_ROOT / "credentials.db")
     try:
         run_auth(db, paste=args.paste)
     except Exception as exc:  # noqa: BLE001 - 授权失败以可读信息退出
@@ -384,7 +392,7 @@ def _run_command(args: argparse.Namespace) -> None:
     config = load_config()
     # 文档 §7 身份层：启动时随机选一个 UA，全程固定贯穿搜索/阶段二/收藏
     session_headers = _session_headers(config)
-    db = Database("cache.db")
+    db = Database(_PROJECT_ROOT / "cache.db")
     ncm = NcmClient(httpx.AsyncClient())
     bili = BiliSearchClient(
         httpx.AsyncClient(),
@@ -413,7 +421,7 @@ def _run_command(args: argparse.Namespace) -> None:
                 ncm,
                 bili,
                 http,
-                output_dir=_DEFAULT_OUTPUT_DIR,
+                output_dir=_PROJECT_ROOT / "output",
                 refresh=args.refresh,
             )
             print(f"任务 {counts['task_id']} 完成")
@@ -436,7 +444,7 @@ def _run_command(args: argparse.Namespace) -> None:
             bili,
             http,
             cookie_str=cookie_str,
-            output_dir=_DEFAULT_OUTPUT_DIR,
+            output_dir=_PROJECT_ROOT / "output",
             refresh=args.refresh,
             session_headers=session_headers,
         )
@@ -482,7 +490,7 @@ def _confirm(prompt: str, yes: bool) -> bool:
 
 
 def _task_list_command(args: argparse.Namespace) -> None:
-    db = Database("cache.db")
+    db = Database(_PROJECT_ROOT / "cache.db")
     try:
         rows = db.list_tasks()
         if not rows:
@@ -495,7 +503,7 @@ def _task_list_command(args: argparse.Namespace) -> None:
 
 
 def _task_delete_command(args: argparse.Namespace) -> None:
-    db = Database("cache.db")
+    db = Database(_PROJECT_ROOT / "cache.db")
     try:
         if args.all_finished:
             row = db.query_one(
@@ -541,7 +549,7 @@ def _task_delete_command(args: argparse.Namespace) -> None:
 
 
 def _task_resume_command(args: argparse.Namespace) -> None:
-    db = Database("cache.db")
+    db = Database(_PROJECT_ROOT / "cache.db")
     task = db.get_task(args.task_id)
     if task is None:
         print(f"任务不存在: {args.task_id}")
@@ -600,7 +608,7 @@ def _task_resume_command(args: argparse.Namespace) -> None:
             ncm,
             bili,
             http,
-            output_dir=_DEFAULT_OUTPUT_DIR,
+            output_dir=_PROJECT_ROOT / "output",
             task_id=args.task_id,
             dry_run=False,  # 文档 §4.1（F2-1）：resume 走正式语义（匹配成功置 MATCHED）
         )
@@ -664,7 +672,7 @@ def _load_cookie() -> str:
     """从 credentials.db 读取并解密 B 站 cookie；无凭证时提示重新 auth。"""
     from auth import load_credentials, load_or_create_key
 
-    cred_db = Database("credentials.db")
+    cred_db = Database(_PROJECT_ROOT / "credentials.db")
     try:
         key = load_or_create_key()
         cookie = load_credentials(cred_db, key)
@@ -719,9 +727,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     # 文档 §12 日志初始化：挂到 root logger（模块 logger 继承），DEBUG 仅 --debug 开启
+    # F3-5（§11.4）：日志目录基于项目根，CWD 无关
     setup_logging(
         level=logging.DEBUG if args.debug else logging.INFO,
         logger_name="",
+        log_dir=_PROJECT_ROOT / "logs",
     )
 
     if args.command == "auth":

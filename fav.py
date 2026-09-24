@@ -116,6 +116,19 @@ class BiliFavClient:
         # 自适应降速状态：连续 -702 计数 → interval 乘数（上限 4 倍）
         self._consecutive_702: int = 0
         self._slowdown_multiplier: float = 1.0
+        # F3-6（§5.2/§8）：bvid→aid 进程内内存缓存——仅缓存 miss 发 view 请求，
+        # 收藏请求量回到 N(deal)+M(view miss)。取舍：aid 为视频 immutable 标
+        # 识（不随时间变化），进程生命周期内无需失效；不做落盘——阶段三单进程
+        # 连续执行，跨进程复用收益小（每进程至多每个 bvid 一次 view），而落盘
+        # 需引入 TTL/失效策略与额外 DDL，收益不抵复杂度。
+        self._aid_cache: dict[str, int] = {}
+
+    @property
+    def concurrency_multiplier(self) -> float:
+        """F3-7（§7 响应层 b）：critical 熔断后降并发倍率（0.5），无熔断器 1.0。"""
+        if self._breaker is None:
+            return 1.0
+        return self._breaker.concurrency_multiplier
 
     @staticmethod
     def _mid_from_cookie(cookies: dict[str, str]) -> int | None:
@@ -314,13 +327,19 @@ class BiliFavClient:
         """bvid → av 号（deal 接口的 rid 需要 aid）。
 
         走 /x/web-interface/view 只读接口；view 详情请求与阶段二同源，可复用。
+
+        F3-6（§5.2/§8）：进程内内存缓存命中直接返回，仅 miss 发 view 请求。
         """
+        cached = self._aid_cache.get(bvid)
+        if cached is not None:
+            return cached
         data = await self._request(
             "GET", _VIEW_URL, params={"bvid": bvid}
         )
         aid = (data.get("data") or {}).get("aid")
         if not isinstance(aid, int):
             raise FavError(f"bvid→aid 转换失败: {bvid}")
+        self._aid_cache[bvid] = aid
         return aid
 
     async def add_resource(self, media_id: int, bvid: str) -> dict:
@@ -466,7 +485,14 @@ async def fav_songs(
     async def worker(media_id: int, song: dict) -> dict:
         async with sem:
             # 文档 §7 预防层 + -702 自适应降速（interval × 客户端乘数，上限 4x）
-            interval_ms = rl.interval_ms * client._slowdown_multiplier
+            # F3-7（§7 响应层 b）：再除以熔断降并发倍率——critical 后
+            # multiplier=0.5，间隔再翻倍；与 _slowdown_multiplier 相乘叠加：
+            # 最终间隔 = base × slowdown × 1/concurrency_multiplier。
+            interval_ms = (
+                rl.interval_ms
+                * client._slowdown_multiplier
+                / client.concurrency_multiplier
+            )
             jitter_lo, jitter_hi = rl.jitter_ms
             await asyncio.sleep(random.uniform(interval_ms + jitter_lo, interval_ms + jitter_hi) / 1000)
             return await client.fav_one(media_id, song)

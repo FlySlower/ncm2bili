@@ -1093,3 +1093,168 @@ async def test_match_gate_thresholds_from_config(respx_mock, tmp_path) -> None:
 
     assert result["status"] == "MANUAL"
     assert "LOW_CONFIDENCE" in result["fail_reason"]
+
+
+# ===================================================================
+# F3-2（§4.2/§6）：闸门拒绝时显式 bvid=None，禁止沿用历史 BV
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_gate_reject_clears_legacy_bvid_then_done_clears_reason(
+    respx_mock, tmp_path,
+) -> None:
+    """F3-2 验收：上一轮 MATCHED 带 bvid，本轮 MatchGate 拒绝 → MANUAL 且
+    bvid IS NULL（不得沿用历史值）；后续白名单救回 DONE，fail_reason 不回退。"""
+    db = Database(tmp_path / "t.db")
+    # 预置上一轮残留：MATCHED + 历史 BV + 评分明细
+    # （task_id 与 _make_matcher 默认 "default" 对齐）
+    db.upsert_song(
+        "夜曲|周杰伦", ncm_id=1001, name="夜曲", artist="周杰伦",
+        status="MATCHED", method="SCORED", bvid="BV1old",
+        score_detail='{"bvid": "BV1old"}',
+    )
+    _mock_env(respx_mock)
+    # 唯一候选标题含歌名+艺人（通过前两闸门）但人气为零：
+    # 10(歌名)+5(时长)=15 < min_score=16 → 闸门 3 低分拒绝
+    respx_mock.get(VIEW_URL).mock(return_value=_ok())
+    respx_mock.get(RELATION_URL).mock(return_value=_ok(follower=100))
+    respx_mock.get(SEARCH_URL).mock(
+        return_value=_ok(result=[_video("BVlow", "夜曲 周杰伦 现场",
+                                        play=0, favorites=0, video_review=0)])
+    )
+
+    matcher = _make_matcher(db)
+    async with matcher:
+        result = await matcher.match_song(SONG)
+
+    assert result["status"] == "MANUAL"
+    assert result["bvid"] is None
+    row = db.query_one("SELECT * FROM songs WHERE song_key = '夜曲|周杰伦'")
+    assert row["status"] == "MANUAL"
+    assert row["bvid"] is None  # 历史 BV 被显式清空，不会进阶段三收藏夹
+    assert "LOW_CONFIDENCE" in (row["fail_reason"] or "")
+
+    # 救回：白名单落 BV（dry_run 直接 DONE）→ bvid 为新值且 fail_reason 清空不回退
+    matcher2 = _make_matcher(db, dry_run=True, whitelist={"夜曲|周杰伦": "BVwl"})
+    async with matcher2:
+        saved = await matcher2.match_song(SONG)
+    assert saved["status"] == "DONE"
+    row2 = db.query_one("SELECT * FROM songs WHERE song_key = '夜曲|周杰伦'")
+    assert row2["bvid"] == "BVwl"
+    assert row2["fail_reason"] is None
+
+
+# ===================================================================
+# F3-3（§4.1 ④）：UPLOADER_WL 双侧归一化
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_uploader_wl_normalizes_both_sides(respx_mock, tmp_path) -> None:
+    """F3-3 验收：大写歌名 + 命中 UP 主 + 全小写标题 → UPLOADER_WL 仍生效。
+
+    修复前 `name in _normalize(title)` 左侧未归一化，"HELLO" 匹配不到小写标题。
+    """
+    db = Database(tmp_path / "t.db")
+    _mock_env(respx_mock)
+    respx_mock.get(SEARCH_URL).mock(
+        return_value=_ok(result=[_video("BV1up", "hello adele 官方mv", mid=999)])
+    )
+
+    song = {"ncm_id": 9, "name": "HELLO", "artist": "Adele"}
+    matcher = _make_matcher(db, uploaders={"999": {"name": "AdeleOfficial", "note": ""}})
+    async with matcher:
+        result = await matcher.match_song(song)
+
+    assert result["method"] == "UPLOADER_WL"
+    assert result["bvid"] == "BV1up"
+    row = db.query_one("SELECT status, method FROM songs WHERE song_key = 'HELLO|Adele'")
+    assert row["status"] == "MATCHED" and row["method"] == "UPLOADER_WL"
+
+
+# ===================================================================
+# B1（F1-1 补测）：降级链 9 轮 sleep 计数与时长
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_degrade_chain_nine_rounds_sleep_count_and_duration(
+    respx_mock, tmp_path, monkeypatch,
+) -> None:
+    """B1 补测：9 轮降级全部未命中 → 恰好 9 次 asyncio.sleep，单次时长
+    ∈ [(interval+jitter_lo)/1000, (interval+jitter_hi)/1000]。"""
+    db = Database(tmp_path / "t.db")
+    _mock_env(respx_mock)
+    respx_mock.get(SEARCH_URL).mock(
+        return_value=httpx.Response(200, json={"code": 0, "data": {"result": []}})
+    )
+
+    cfg = Config()
+    cfg.rate_limit.search.interval_ms = 120
+    cfg.rate_limit.search.jitter_ms = [30, 80]
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    matcher = Matcher(
+        cfg, db, BiliSearchClient(httpx.AsyncClient(), db=db),
+        NcmClient(httpx.AsyncClient()), httpx.AsyncClient(),
+    )
+    async with matcher:
+        result = await matcher.match_song(SONG)
+
+    assert result["status"] == "MANUAL"
+    assert len(sleeps) == 9  # 每轮入口一次 sleep，恰好 9 次
+    lo = (120 + 30) / 1000
+    hi = (120 + 80) / 1000
+    assert all(lo <= s <= hi for s in sleeps), f"sleep 时长越界: {sleeps}"
+
+
+# ===================================================================
+# F3-7（§7 响应层 b）：搜索 worker 接入熔断降并发倍率
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_search_sleep_doubled_under_critical_breaker(
+    respx_mock, tmp_path, monkeypatch,
+) -> None:
+    """F3-7 搜索侧：critical 熔断 multiplier=0.5 → 搜索 sleep 间隔翻倍补偿。"""
+    from circuit_breaker import CircuitBreaker
+
+    db = Database(tmp_path / "t.db")
+    _mock_env(respx_mock)
+    respx_mock.get(SEARCH_URL).mock(
+        return_value=_ok(result=[_video("BV1m", "夜曲 周杰伦 官方MV")])
+    )
+
+    cfg = Config()
+    cfg.rate_limit.search.interval_ms = 100
+    cfg.rate_limit.search.jitter_ms = [0, 0]
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    breaker = CircuitBreaker()
+    breaker._concurrency_cut = True  # critical 已触发（不构造暂停）
+    assert breaker.concurrency_multiplier == 0.5
+
+    matcher = Matcher(
+        cfg, db,
+        BiliSearchClient(httpx.AsyncClient(), db=db, breaker=breaker),
+        NcmClient(httpx.AsyncClient()), httpx.AsyncClient(),
+    )
+    async with matcher:
+        await matcher._search_cached(SONG, "夜曲 周杰伦")
+
+    # base=100ms / 0.5 = 200ms
+    assert sleeps == [0.2], f"critical 后搜索间隔应翻倍为 0.2s，实际 {sleeps}"

@@ -139,6 +139,14 @@ class BiliSearchClient:
         self._buvid3: str | None = None
         self._buvid4: str | None = None
 
+    @property
+    def concurrency_multiplier(self) -> float:
+        """F3-7（§7 响应层 b）：critical 熔断后的降并发倍率（0.5）；
+        无熔断器时为 1.0。搜索 worker 按 1/multiplier 追加 sleep 补偿。"""
+        if self._breaker is None:
+            return 1.0
+        return self._breaker.concurrency_multiplier
+
     # ---- 请求基础（B 站语义：code==0 成功）-----------------------
 
     async def _request_json(

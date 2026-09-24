@@ -4,18 +4,25 @@
 - 文件：logs/app_YYYY-MM-DD.log，全级别，含时间/模块/级别；
 - 脱敏铁律：日志 Filter 在 Formatter 之前把 SESSDATA / bili_jct / buvid3
   的 cookie 值统一替换为 <redacted>，DEBUG 级也不例外（文档 §12）。
+- F3-4（§9.4/§12）：脱敏同时覆盖普通消息与异常堆栈——record.exc_info
+  预先格式化为脱敏后的 exc_text（Formatter 优先复用 exc_text 缓存），
+  stack_info 同步脱敏；任何日志/异常堆栈不得输出完整 cookie。
 """
 from __future__ import annotations
 
 import logging
 import re
+import traceback
 from datetime import datetime
 from pathlib import Path
+
+# F3-5（§11.4）：默认日志目录基于项目根解析，与 CWD 无关
+_PROJECT_ROOT = Path(__file__).resolve().parent
 
 # cookie 名大小写不敏感，值匹配到分号或空白为止（保留结尾分号）
 _COOKIE_RE = re.compile(r"(SESSDATA|bili_jct|buvid3)=([^;\s]+)", re.IGNORECASE)
 
-_DEFAULT_LOG_DIR = Path("logs")
+_DEFAULT_LOG_DIR = _PROJECT_ROOT / "logs"
 _CONSOLE_FORMAT = "%(levelname)s %(message)s"
 _FILE_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
@@ -27,7 +34,15 @@ def redact_cookie(text: str) -> str:
 
 
 class RedactFilter(logging.Filter):
-    """日志脱敏 Filter：在 Formatter 之前改写消息内容。"""
+    """日志脱敏 Filter：在 Formatter 之前改写消息内容。
+
+    F3-4（§9.4/§12）：覆盖三条输出路径——
+    1. 普通消息 record.msg/args（cookie 出现在日志文本中）；
+    2. 异常堆栈 record.exc_info：此处预先格式化为 exc_text 并脱敏；
+       logging.Formatter.format() 在 exc_text 非空时直接复用（不再自行
+       traceback.formatException），故控制台/文件输出均为脱敏文本；
+    3. record.stack_info（logger.error(..., stack_info=True) 的栈帧转储）。
+    """
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
@@ -35,6 +50,15 @@ class RedactFilter(logging.Filter):
         if redacted != msg:
             record.msg = redacted
             record.args = ()
+        if record.exc_info:
+            # 预格式化并缓存到 exc_text：Formatter 检测到 exc_text 非空会原样复用
+            record.exc_text = redact_cookie(
+                "".join(traceback.format_exception(*record.exc_info))
+            )
+        elif record.exc_text:
+            record.exc_text = redact_cookie(record.exc_text)
+        if record.stack_info:
+            record.stack_info = redact_cookie(record.stack_info)
         return True
 
 

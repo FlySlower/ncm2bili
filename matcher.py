@@ -172,11 +172,12 @@ class Matcher:
         self._task_id = task_id
         self._dry_run = dry_run
         # 文档 §6：whitelist_bv 表为优先级统一入口，内存 dict 移除。
-        # 传入的 whitelist/manual 同步进表，运行时仅从表读取。
-        for key, bvid in (whitelist or {}).items():
-            self._db.upsert_whitelist_bv(key, bvid, source="whitelist")
-        for key, bvid in (manual or {}).items():
-            self._db.upsert_whitelist_bv(key, bvid, source="manual")
+        # F3-1（§4.4）：json 是唯一事实源，启动按 source 全量重建（先 DELETE
+        # 再批量 upsert），json 删除的条目同步从表中删除。必须按
+        # whitelist → manual 顺序：两 source 同键时一行只存一个 source，
+        # manual 后写覆盖（与"manual 优先级最高"一致，详见 db.replace_priority_map）。
+        self._db.replace_priority_map("whitelist", whitelist or {})
+        self._db.replace_priority_map("manual", manual or {})
         # uploaders 的 mid key 归一化为 int（JSON 中可能是字符串），与搜索返回的 int mid 对齐
         self._uploaders = {
             (int(k) if str(k).isdigit() else k): v for k, v in (uploaders or {}).items()
@@ -279,10 +280,11 @@ class Matcher:
         except BiliError as exc:
             # 文档 §9.1：搜索重试耗尽（BiliError）不崩任务——单歌降级 MANUAL，
             # fail_reason 记 SEARCH_FAILED 并携带关键词与根因，任务继续执行。
+            # F3-2（§4.2/§6）：MANUAL 路径显式 bvid=None，禁止沿用上一轮残留 BV。
             fail_reason = f"SEARCH_FAILED: {keyword} {type(exc).__name__}: {exc}"
             self._db.upsert_song(
                 key, task_id=self._task_id, status="MANUAL", method="MANUAL",
-                fail_reason=fail_reason,
+                bvid=None, fail_reason=fail_reason,
             )
             return {
                 "song_key": key,
@@ -295,8 +297,11 @@ class Matcher:
         # MANUAL（文档 §4.1 第⑦步；§4.2 闸门耗尽记对应 fail_reason + score_detail 落库）
         if last_gate_fail is not None:
             reason = last_gate_fail
+            # F3-2（§4.2/§6）：MatchGate 不采纳显式 bvid=None——禁止沿用上一轮
+            # （或其他任务重跑残留）的 bvid；score_detail 含 top3 候选照常落库。
             self._db.upsert_song(
                 key, task_id=self._task_id, status="MANUAL", method="MANUAL",
+                bvid=None,
                 fail_reason=reason,
                 score_detail=(
                     json.dumps(last_score_detail, ensure_ascii=False)
@@ -315,8 +320,11 @@ class Matcher:
         reason = "匹配失败：降级链全部未命中"
         if blocked_total:
             reason += f"；黑名单淘汰 {blocked_total} 个候选"
+        # F3-2（§4.2/§6）：MANUAL 路径显式 bvid=None / score_detail=None，
+        # 禁止沿用上一轮残留 BV 与评分明细
         self._db.upsert_song(
-            key, task_id=self._task_id, status="MANUAL", method="MANUAL", fail_reason=reason
+            key, task_id=self._task_id, status="MANUAL", method="MANUAL",
+            bvid=None, score_detail=None, fail_reason=reason
         )
         return {
             "song_key": key,
@@ -342,8 +350,14 @@ class Matcher:
             (blocked if self._is_blocked(cand["title"]) else passed).append(cand)
 
         # ④ uploaders 命中（跳过打分与 MatchGate，文档 §4.2：白名单路径不经门槛）
+        # F3-3（§4.1 ④）：双侧归一化 _normalize(name) in _normalize(title)，
+        # 大小写/全半角/标点差异不漏判（原文子串匹配已废弃）
         for cand in passed:
-            if cand.get("mid") in self._uploaders and name and name in _normalize(cand["title"]):
+            if (
+                cand.get("mid") in self._uploaders
+                and name
+                and _normalize(name) in _normalize(cand["title"])
+            ):
                 return {"method": "UPLOADER_WL", "bvid": cand["bvid"], "blocked": len(blocked)}
 
         # ⑤ 两阶段评分 + 置信度准入（MatchGate，文档 §4.2）
@@ -439,10 +453,11 @@ class Matcher:
         """
         # 文档 §7 预防层 / F1-1：每次搜索请求前 sleep = interval_ms + uniform(jitter)。
         # 下沉到 _search_cached 入口，覆盖降级链每一轮与缓存命中路径（F1-1 明确）。
+        # F3-7（§7 响应层 b）：critical 熔断后按 breaker.concurrency_multiplier
+        # 追加 sleep 补偿——multiplier=0.5 时间隔翻倍（风控感知请求频率而非协程数）。
         rl = self._config.rate_limit.search
-        await asyncio.sleep(
-            (rl.interval_ms + random.uniform(*rl.jitter_ms)) / 1000
-        )
+        base_sleep = (rl.interval_ms + random.uniform(*rl.jitter_ms)) / 1000
+        await asyncio.sleep(base_sleep / self._bili.concurrency_multiplier)
 
         ttl = self._config.cache.search_cache_ttl_s
         name = sanitize_song_name(
