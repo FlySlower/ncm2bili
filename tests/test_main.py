@@ -620,26 +620,25 @@ async def test_delete_task_clears_songs_keeps_cache(respx_mock, tmp_path) -> Non
     assert db.query_one("SELECT results FROM search_cache WHERE keyword = '歌1 艺1'") is not None
 
 
-def test_task_subcommands_parse(tmp_path) -> None:
+def test_task_subcommands_parse(tmp_path, monkeypatch) -> None:
     """task 子命令注册与参数解析（list/resume/delete/--yes/--all-finished）。"""
     import contextlib
     import io
-    import os
 
+    import main as main_mod
     from main import main
+
+    # F3-5（§11.4）：数据路径基于项目根而非 CWD——monkeypatch 项目根常量
+    # 重定向到 tmp（旧测试靠 chdir 隔离已失效）；同时验证 CWD 无关性。
+    monkeypatch.setattr(main_mod, "_PROJECT_ROOT", tmp_path)
 
     # 无任务时 list 输出"暂无任务"且不报错（不触发确认逻辑）
     db = Database(tmp_path / "cache.db")
     db.close()
 
     buf = io.StringIO()
-    old_cwd = os.getcwd()
-    os.chdir(tmp_path)
-    try:
-        with contextlib.redirect_stdout(buf):
-            main(["task", "list"])
-    finally:
-        os.chdir(old_cwd)
+    with contextlib.redirect_stdout(buf):
+        main(["task", "list"])
     assert "暂无任务" in buf.getvalue()
 
     # resume 不存在的任务 → SystemExit 1
@@ -831,9 +830,12 @@ def test_resume_injects_breaker_trips_on_412(respx_mock, tmp_path, monkeypatch) 
     改动点（v0.4.1）：-412 重试耗尽 → BiliError 被 matcher 捕获单歌降级 MANUAL，
     resume 正常完成不再抛异常；熔断照常触发。
     """
-    import os as _os
+    import main as main_mod
 
     from main import main
+
+    # F3-5（§11.4）：CLI 数据路径基于 main._PROJECT_ROOT，重定向到 tmp
+    monkeypatch.setattr(main_mod, "_PROJECT_ROOT", tmp_path)
 
     # 1 首歌的歌单（最小化请求量）
     one_song = [SONGS[0]]
@@ -862,13 +864,8 @@ def test_resume_injects_breaker_trips_on_412(respx_mock, tmp_path, monkeypatch) 
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
-    old_cwd = _os.getcwd()
-    _os.chdir(tmp_path)
-    try:
-        # 全程 -412：单请求重试耗尽按 §9.1 单歌降级——resume 正常完成，不抛异常
-        main(["task", "resume", tid, "--yes"])
-    finally:
-        _os.chdir(old_cwd)
+    # 全程 -412：单请求重试耗尽按 §9.1 单歌降级——resume 正常完成，不抛异常
+    main(["task", "resume", tid, "--yes"])
 
     # 熔断触发：观察到大额全局暂停（warn 阈值 3 次 -412 → 暂停 60s；容忍单调钟漂移）
     assert any(s >= 59 for s in sleeps), f"未观察到熔断全局暂停，sleeps={sleeps}"
@@ -893,9 +890,12 @@ def test_resume_retries_fav_failed_without_search(respx_mock, tmp_path, monkeypa
     - 收藏夹按 §5.3 名称复用（已有同名夹 → 零建夹）；
     - deal 重试成功 → status 回 DONE。
     """
-    import os as _os
+    import main as main_mod
 
     from main import main
+
+    # F3-5（§11.4）：CLI 数据路径基于 main._PROJECT_ROOT，重定向到 tmp
+    monkeypatch.setattr(main_mod, "_PROJECT_ROOT", tmp_path)
 
     # 1 首歌的歌单：resume 阶段一仍抓取，但 FAV_FAILED 歌不重新匹配
     one_song = [SONGS[0]]  # 歌1|艺1
@@ -943,12 +943,7 @@ def test_resume_retries_fav_failed_without_search(respx_mock, tmp_path, monkeypa
     # 凭证视为已授权（resume 阶段三需要 cookie；凭证获取本身由 auth 模块负责）
     monkeypatch.setattr("main._load_cookie", lambda: COOKIE)
 
-    old_cwd = _os.getcwd()
-    _os.chdir(tmp_path)
-    try:
-        main(["task", "resume", tid, "--yes"])
-    finally:
-        _os.chdir(old_cwd)
+    main(["task", "resume", tid, "--yes"])
 
     # 搜索接口零调用（FAV_FAILED 不回 matcher）
     assert search_calls["n"] == 0
@@ -1096,9 +1091,12 @@ def test_resume_deals_matched_and_fav_failed_exactly_once(
     """验收（§4.4）：阶段三中断后 resume——MATCHED（首次收藏）与 FAV_FAILED
     （重试收藏）都执行 deal 且恰好一次（deal 次数 = 未完成数），已收藏（DONE）
     不重复 deal，全部完成后任务置 DONE。"""
-    import os as _os
+    import main as main_mod
 
     from main import main
+
+    # F3-5（§11.4）：CLI 数据路径基于 main._PROJECT_ROOT，重定向到 tmp
+    monkeypatch.setattr(main_mod, "_PROJECT_ROOT", tmp_path)
 
     three_songs = SONGS[:3]
     track_ids = [{"id": s["id"]} for s in three_songs]
@@ -1147,12 +1145,7 @@ def test_resume_deals_matched_and_fav_failed_exactly_once(
 
     monkeypatch.setattr("main._load_cookie", lambda: COOKIE)
 
-    old_cwd = _os.getcwd()
-    _os.chdir(tmp_path)
-    try:
-        main(["task", "resume", tid, "--yes"])
-    finally:
-        _os.chdir(old_cwd)
+    main(["task", "resume", tid, "--yes"])
 
     # 三首都不回 matcher（DONE/MATCHED/FAV_FAILED 均在阶段二跳过集合内）
     assert search_calls["n"] == 0
@@ -1175,36 +1168,78 @@ def test_resume_deals_matched_and_fav_failed_exactly_once(
 # ---- CLI 日志初始化（文档 §12：--debug + 脱敏 Filter 挂载）-------------
 
 
-def test_cli_logging_setup_redacts_debug(tmp_path, capsys) -> None:
+def test_cli_logging_setup_redacts_debug(tmp_path, capsys, monkeypatch) -> None:
     """验收：main 入口调用 setup_logging 挂载脱敏 Filter；--debug 下 DEBUG 日志仍脱敏。
 
     root logger 全局状态由 tests/conftest.py 的 autouse fixture 测试后还原。
+    F3-5（§11.4）：日志目录基于项目根——monkeypatch 重定向到 tmp，
+    不向真实项目 logs/ 写文件。
     """
     import logging
-    import os
 
+    import main as main_mod
     from logging_setup import RedactFilter
     from main import main
 
-    old_cwd = os.getcwd()
-    os.chdir(tmp_path)
-    try:
-        # --debug 启动（task list 无真实副作用，仅触发 CLI 初始化）
-        main(["--debug", "task", "list"])
-        root = logging.getLogger()
-        # root 上挂载了脱敏 Filter
-        has_redact = any(
-            isinstance(f, RedactFilter)
-            for handler in root.handlers
-            for f in handler.filters
-        )
-        assert has_redact, "root logger 缺 RedactFilter"
-        assert root.isEnabledFor(logging.DEBUG), "--debug 未开启 DEBUG 级别"
+    monkeypatch.setattr(main_mod, "_PROJECT_ROOT", tmp_path)
 
-        # DEBUG 级日志输出 cookie → 必须脱敏（StreamHandler 绑定 capsys 的 stderr）
-        logging.getLogger("fav").debug("登录成功 SESSDATA=super-secret; bili_jct=xy;")
-        out = capsys.readouterr().err
-        assert "SESSDATA=<redacted>" in out, f"未脱敏，输出: {out!r}"
-        assert "super-secret" not in out, "明文 cookie 泄漏"
-    finally:
-        os.chdir(old_cwd)
+    # --debug 启动（task list 无真实副作用，仅触发 CLI 初始化）
+    main(["--debug", "task", "list"])
+    root = logging.getLogger()
+    # root 上挂载了脱敏 Filter
+    has_redact = any(
+        isinstance(f, RedactFilter)
+        for handler in root.handlers
+        for f in handler.filters
+    )
+    assert has_redact, "root logger 缺 RedactFilter"
+    assert root.isEnabledFor(logging.DEBUG), "--debug 未开启 DEBUG 级别"
+
+    # DEBUG 级日志输出 cookie → 必须脱敏（StreamHandler 绑定 capsys 的 stderr）
+    logging.getLogger("fav").debug("登录成功 SESSDATA=super-secret; bili_jct=xy;")
+    out = capsys.readouterr().err
+    assert "SESSDATA=<redacted>" in out, f"未脱敏，输出: {out!r}"
+    assert "super-secret" not in out, "明文 cookie 泄漏"
+
+
+# ---- F3-5（§11.4）：CWD 无关；B3（F2-1 补测）：CLI 输出含 MATCHED -------
+
+
+def test_cli_uses_project_root_regardless_of_cwd(tmp_path, monkeypatch) -> None:
+    """F3-5 验收：从项目外目录运行 task list 仍读到项目数据，CWD 不产生新文件；
+    B3 补测：输出行含 MATCHED 计数。"""
+    import contextlib
+    import io
+
+    import main as main_mod
+    from main import main
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    cwd_dir = tmp_path / "elsewhere"
+    cwd_dir.mkdir()
+
+    # 项目数据：一个任务含 1 MATCHED + 1 MANUAL
+    db = Database(project_dir / "cache.db")
+    tid = db.create_task("556677")
+    db.upsert_song("歌1|艺1", task_id=tid, ncm_id=1, status="MATCHED",
+                   method="SCORED", bvid="BV1m")
+    db.upsert_song("歌2|艺2", task_id=tid, ncm_id=2, status="MANUAL", method="MANUAL")
+    db.close()
+
+    monkeypatch.setattr(main_mod, "_PROJECT_ROOT", project_dir)
+    monkeypatch.chdir(cwd_dir)  # 从"项目外"目录启动 CLI
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(["task", "list"])
+    output = buf.getvalue()
+
+    assert "556677" in output  # 读到项目数据
+    assert "MATCHED1" in output  # B3：CLI 输出含 MATCHED 计数
+    assert "MANUAL1" in output
+    # CWD 无任何数据文件落进来
+    assert not (cwd_dir / "cache.db").exists()
+    assert not (cwd_dir / "credentials.db").exists()
+    assert not (cwd_dir / "output").exists()
+    assert not (cwd_dir / "logs").exists()

@@ -314,6 +314,26 @@ def test_review_html_no_sensitive_data(tmp_path) -> None:
     assert "未启动" in text  # save_url=None 时提示服务未启动
 
 
+def test_review_html_static_open_save_unavailable_hint(tmp_path) -> None:
+    """B2 补测（F1-4）：不传 save_url 生成的页面可静态打开——
+
+    1) 页面含"保存不可用"提示文案；
+    2) 内嵌 script 保留 fetch 失败的 catch 分支（静态文件双击打开时
+       fetch 必然失败，用户看到"无法连接保存服务"而非无响应）。静态断言，
+       不起浏览器。
+    """
+    rows = [_manual_song("夜曲|周杰伦", "夜曲", "周杰伦")]
+    path = write_review_html(rows, tmp_path / "review.html")  # save_url=None
+
+    text = path.read_text(encoding="utf-8")
+    assert "保存不可用" in text
+    # catch 分支与用户可见的失败提示均在
+    assert "} catch (e) {" in text
+    assert "无法连接保存服务" in text
+    # SAVE_URL 为空串（fetch("") 走 catch，而非误以为已配置服务）
+    assert 'const SAVE_URL = "";' in text
+
+
 # ---- 验收 5：端到端 —— manual 按优先级铁律生效 -------------------------
 
 

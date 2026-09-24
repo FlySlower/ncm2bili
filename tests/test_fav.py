@@ -729,3 +729,86 @@ async def test_minus412_counts_into_global_circuit_breaker(tmp_path, monkeypatch
     assert result["status"] == "FAV_FAILED"
     assert breaker.recent_failures >= 3  # 每次 -412 计入滑动窗口
     assert breaker.is_paused  # 达到 warn 阈值 3 次 → 已触发全局暂停
+
+
+# ---- F3-6（§5.2/§8）：bvid→aid 进程内缓存 -----------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_bvid_to_aid_cache_single_view_per_bvid(tmp_path) -> None:
+    """F3-6 验收：同一 bvid 收藏 2 次 → view 请求仅 1 次（缓存命中不重复请求）。"""
+    db = Database(tmp_path / "t.db")
+    view_route = respx.get(VIEW_URL).mock(
+        return_value=httpx.Response(200, json={"code": 0, "data": {"aid": 753394975}})
+    )
+    deal_route = respx.post(RESOURCE_ADD_URL).mock(
+        return_value=httpx.Response(200, json={"code": 0})
+    )
+
+    client = _client(db)
+    async with client._client:
+        await client.add_resource(1, "BV1same")
+        await client.add_resource(1, "BV1same")
+
+    assert view_route.call_count == 1  # 第二次命中进程内缓存，view 仅 1 次
+    assert deal_route.call_count == 2  # deal 不受缓存影响，照常两次
+    assert client._aid_cache == {"BV1same": 753394975}
+
+
+# ---- F3-7（§7 响应层 b）：critical 熔断后单位时间请求量下降 -------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_critical_breaker_halves_fav_request_rate(tmp_path) -> None:
+    """F3-7 验收：critical 熔断（multiplier=0.5）后收藏 worker 间隔翻倍，
+    单位时间请求量下降——4 首串行批次的墙钟耗时 critical ≥ 正常 × 1.5。"""
+    import time as _time
+
+    from circuit_breaker import CircuitBreaker
+
+    db = Database(tmp_path / "t.db")
+
+    # view：按 bvid 末位返回 aid
+    def view_handler(request: httpx.Request) -> httpx.Response:
+        bvid = parse_qs(request.url.query.decode()).get("bvid", [""])[0]
+        return httpx.Response(200, json={"code": 0, "data": {"aid": 9000 + int(bvid[-1])}})
+
+    respx.get(VIEW_URL).mock(side_effect=view_handler)
+    respx.get(FOLDER_LIST_URL).mock(return_value=_ok(list=[]))
+    respx.post(FOLDER_ADD_URL).mock(return_value=_ok(id=10))
+    respx.post(RESOURCE_ADD_URL).mock(return_value=httpx.Response(200, json={"code": 0}))
+
+    cfg = Config()
+    cfg.rate_limit.fav.concurrency = 1   # 串行，墙钟 ≈ Σ sleep
+    cfg.rate_limit.fav.interval_ms = 60
+    cfg.rate_limit.fav.jitter_ms = [0, 0]
+
+    async def _run_batch(tag: str, breaker: CircuitBreaker | None) -> float:
+        songs = [_song(f"歌{tag}{i}|艺", f"BV{tag}{i}") for i in range(1, 5)]
+        for s in songs:
+            s["task_id"] = "t1"
+        client = BiliFavClient(
+            httpx.AsyncClient(), db, cfg, COOKIE, breaker=breaker,
+        )
+        async with client._client:
+            t0 = _time.perf_counter()
+            summary = await fav_songs(client, db, cfg, songs, "歌单")
+            elapsed = _time.perf_counter() - t0
+        assert summary["statuses"].get("DONE") == 4
+        return elapsed
+
+    # 正常（无熔断）：每首 60ms
+    normal_elapsed = await _run_batch("n", None)
+
+    # critical：窗口内 5 次 -412 → 降并发标记打开（不暂停：直接置标记位）
+    critical = CircuitBreaker()
+    critical._concurrency_cut = True
+    assert critical.concurrency_multiplier == 0.5
+    critical_elapsed = await _run_batch("c", critical)
+
+    # 间隔翻倍 → 单位时间请求量减半；阈值 1.5 留调度抖动余量（理论 2.0）
+    assert critical_elapsed >= normal_elapsed * 1.5, (
+        f"critical 未降速: normal={normal_elapsed:.3f}s critical={critical_elapsed:.3f}s"
+    )

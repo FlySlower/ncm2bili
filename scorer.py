@@ -29,6 +29,14 @@ _SPAM_FOLLOWER_THRESHOLD = 100
 _SPAM_PLAY_THRESHOLD = 100_000
 
 
+def _norm(text: str) -> str:
+    """F3-8（§4.2）：标题/歌名归一化，与 MatchGate 闸门 1 同源（matcher._normalize：
+    去 HTML/实体、小写、去标点、空白折叠）。函数级导入规避 matcher↔scorer 循环
+    导入（matcher 顶部导入 scorer）；sys.modules 缓存后无额外开销。"""
+    from matcher import _normalize
+    return _normalize(text)
+
+
 def _parse_duration(raw: Any) -> float:
     """解析 B 站搜索结果的 duration 为秒。
 
@@ -73,10 +81,14 @@ def stage1_score(video: dict[str, Any], song_name: str, config: ScoringConfig) -
         + config.w2_fav * math.log10(fav + 1)
         + config.w3_reply * math.log10(reply + 1)
     )
-    if song_name and song_name in title:
+    # F3-8（§4.2）：title_bonus 统一经归一化比较（大小写/全半角/标点不敏感），
+    # 与 MatchGate 闸门 1 同源 _normalize；修复前为原文子串匹配，大写歌名/小写
+    # 标题等差异会漏发 +10/+3。
+    norm_title = _norm(title)
+    if song_name and _norm(song_name) in norm_title:
         score += config.title_bonus_name
     for kw in _TITLE_KEYWORDS:
-        if kw in title:
+        if _norm(kw) in norm_title:
             score += config.title_bonus_keyword
     if 60 <= duration <= 8 * 60:
         score += config.duration_bonus

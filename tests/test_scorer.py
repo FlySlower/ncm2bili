@@ -40,6 +40,40 @@ def test_stage1_formula() -> None:
     assert score == pytest.approx(expected)
 
 
+def test_stage1_title_bonus_normalized_case_and_punct() -> None:
+    """F3-8 验收（§4.2）：大写歌名 + 全小写标题 → title_bonus_name 仍 +10；
+    小写 "mv" 仍命中关键词 +3；标点/空白差异不影响（与 MatchGate 闸门 1 同源）。"""
+    cfg = Config().scoring
+    # 修复前："Hello" 原文不在全小写标题、"MV" 原文不匹配 "mv" → 两个 bonus 全漏
+    hit = stage1_score(
+        _video(play=0, favorites=0, reply=0, duration=240, title="hello adele mv"),
+        "Hello",
+        cfg,
+    )
+    # 对照组：标题不含歌名与任何关键词，其余维度一致
+    miss = stage1_score(
+        _video(play=0, favorites=0, reply=0, duration=240, title="无关现场"),
+        "Hello",
+        cfg,
+    )
+    assert hit - miss == pytest.approx(cfg.title_bonus_name + cfg.title_bonus_keyword)
+
+    # 标点/空白：歌名 "Hello, World" vs 标题 "hello world ..."
+    punct_hit = stage1_score(
+        _video(play=0, favorites=0, reply=0, duration=240, title="hello world 现场"),
+        "Hello, World",
+        cfg,
+    )
+    assert punct_hit - miss == pytest.approx(cfg.title_bonus_name)
+
+    # 反向不误伤：不含归一化歌名的标题不得 +10
+    assert stage1_score(
+        _video(play=0, favorites=0, reply=0, duration=240, title="hel lo"),
+        "Hello",
+        cfg,
+    ) == pytest.approx(miss)
+
+
 def test_stage1_duration_mmss_string() -> None:
     """B 站搜索接口 duration 为 "mm:ss" 字符串，须正确换算为秒（真实环境 bug 回归）。"""
     cfg = Config().scoring

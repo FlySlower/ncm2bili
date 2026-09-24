@@ -189,13 +189,17 @@ def test_list_tasks_shows_stats(tmp_path) -> None:
         # t1 有 2 首（1 DONE + 1 MANUAL）
         db.upsert_song("a1|艺", task_id=t1, status="DONE")
         db.upsert_song("a2|艺", task_id=t1, status="MANUAL")
+        # B3（F2-1 补测）：MATCHED 单独计数
+        db.upsert_song("a3|艺", task_id=t1, status="MATCHED")
         # t2 空
         rows = db.list_tasks()
         by_id = {r["task_id"]: r for r in rows}
-        assert by_id[t1]["total_songs"] == 2
+        assert by_id[t1]["total_songs"] == 3
         assert by_id[t1]["done_songs"] == 1
+        assert by_id[t1]["matched_songs"] == 1
         assert by_id[t1]["manual_songs"] == 1
         assert by_id[t2]["total_songs"] == 0
+        assert by_id[t2]["matched_songs"] == 0
         # 两个任务都列出；新任务在前（created_at 同秒时顺序不稳定，只校验都在）
         assert {r["task_id"] for r in rows} == {t1, t2}
         assert rows[0]["created_at"] >= rows[1]["created_at"]
@@ -342,5 +346,101 @@ def test_migrate_done_to_matched_v044(tmp_path) -> None:
             "SELECT status FROM songs WHERE song_key = '歌1|艺1' AND task_id = 't-legacy'"
         )
         assert row["status"] == "DONE"
+    finally:
+        db.close()
+
+
+# ---- F3-1（§4.4/§6）：whitelist_bv 按 source 全量重建 -----------------
+
+
+def test_replace_priority_map_deletes_json_removed_entries(tmp_path) -> None:
+    """F3-1 验收①：json 删除条目后重启全量重建 → 表中对应行消失。"""
+    db = Database(tmp_path / "test.db")
+    try:
+        # 首次启动：whitelist.json 含 a/b 两条
+        db.replace_priority_map("whitelist", {"a|x": "BV1a", "b|y": "BV1b"})
+        assert db.load_priority_map("whitelist") == {"a|x": "BV1a", "b|y": "BV1b"}
+
+        # 重启：json 删掉 b、新增 c → b 行必须消失（旧 upsert-only 会残留）
+        db.replace_priority_map("whitelist", {"a|x": "BV1a", "c|z": "BV1c"})
+        assert db.load_priority_map("whitelist") == {"a|x": "BV1a", "c|z": "BV1c"}
+
+        # json 清空 → 表清空
+        db.replace_priority_map("whitelist", {})
+        assert db.load_priority_map("whitelist") == {}
+    finally:
+        db.close()
+
+
+def test_replace_priority_map_sources_independent_and_manual_wins(tmp_path) -> None:
+    """F3-1 验收②：manual/whitelist 分 source 互不影响；同键 manual 后写覆盖。"""
+    db = Database(tmp_path / "test.db")
+    try:
+        # 重建顺序与 Matcher 一致：whitelist → manual
+        db.replace_priority_map("whitelist", {"w|1": "BVw", "shared|k": "BVfrom_wl"})
+        db.replace_priority_map("manual", {"m|1": "BVm", "shared|k": "BVfrom_manual"})
+
+        assert db.load_priority_map("whitelist") == {"w|1": "BVw"}
+        assert db.load_priority_map("manual") == {
+            "m|1": "BVm",
+            "shared|k": "BVfrom_manual",  # 单列主键：manual 后写覆盖同键
+        }
+
+        # 第二轮：manual.json 删掉 shared|k → 该行回退为 whitelist 语义
+        # （whitelist 先重建：DELETE whitelist 不影响 manual 行，再 upsert 覆盖回 whitelist）
+        db.replace_priority_map("whitelist", {"w|1": "BVw", "shared|k": "BVfrom_wl"})
+        db.replace_priority_map("manual", {"m|1": "BVm"})
+        assert db.load_priority_map("whitelist") == {
+            "w|1": "BVw",
+            "shared|k": "BVfrom_wl",
+        }
+        assert db.load_priority_map("manual") == {"m|1": "BVm"}
+
+        # 第三轮：两个 json 都删 shared|k → 行彻底消失
+        db.replace_priority_map("whitelist", {"w|1": "BVw"})
+        db.replace_priority_map("manual", {"m|1": "BVm"})
+        assert db.load_priority_map("whitelist") == {"w|1": "BVw"}
+        assert db.query_one(
+            "SELECT bvid FROM whitelist_bv WHERE song_key = 'shared|k'"
+        ) is None
+    finally:
+        db.close()
+
+
+# ---- F3-2（§4.2/§6）：清空类字段白名单（显式 NULL 写入）----------------
+
+
+def test_upsert_song_explicit_null_clears_bvid_and_score_detail(tmp_path) -> None:
+    """F3-2 db 侧：bvid/score_detail 显式传 None 必须写 NULL 覆盖历史值。"""
+    db = Database(tmp_path / "test.db")
+    try:
+        db.upsert_song(
+            "歌|艺", status="MATCHED", method="SCORED", bvid="BV1old",
+            score_detail='{"stage1": 18}',
+        )
+        # 闸门拒绝落 MANUAL：显式 bvid=None / score_detail=None
+        db.upsert_song(
+            "歌|艺", status="MANUAL", method="MANUAL",
+            bvid=None, score_detail=None, fail_reason="GATE2_NO_NAME: 0",
+        )
+        row = db.query_one(
+            "SELECT bvid, score_detail, fail_reason FROM songs WHERE song_key = '歌|艺'"
+        )
+        assert row["bvid"] is None
+        assert row["score_detail"] is None
+        assert row["fail_reason"] == "GATE2_NO_NAME: 0"
+    finally:
+        db.close()
+
+
+def test_upsert_song_omit_bvid_keeps_history(tmp_path) -> None:
+    """F3-2 反向保护：未传 bvid（键缺失）时沿用历史值，仅显式 None 才清空。"""
+    db = Database(tmp_path / "test.db")
+    try:
+        db.upsert_song("歌|艺", status="MATCHED", method="SCORED", bvid="BV1keep")
+        db.upsert_song("歌|艺", status="FAV_FAILED", method="SCORED",
+                       fail_reason="收藏失败（code -404）")
+        row = db.query_one("SELECT bvid FROM songs WHERE song_key = '歌|艺'")
+        assert row["bvid"] == "BV1keep"
     finally:
         db.close()
