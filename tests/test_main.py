@@ -105,8 +105,12 @@ def _make_components(tmp_path) -> tuple:
     # F1-1：搜索 sleep 下沉到 _search_cached，测试归零限速避免拖慢
     config.rate_limit.search.interval_ms = 0
     config.rate_limit.search.jitter_ms = [0, 0]
+    # F4-3：阶段二补查限速同步归零（matcher 传 rate_limit.stage2）
+    config.rate_limit.stage2.interval_ms = 0
+    config.rate_limit.stage2.jitter_ms = [0, 0]
     ncm = NcmClient(httpx.AsyncClient())
-    bili = BiliSearchClient(httpx.AsyncClient(), db=db)
+    # F4-2：零退避，避免失败路径真实 sleep 2s→4s→8s
+    bili = BiliSearchClient(httpx.AsyncClient(), db=db, retry_delays_s=[0.0, 0.0, 0.0])
     http = httpx.AsyncClient()
     return db, config, ncm, bili, http
 
@@ -379,7 +383,7 @@ async def test_412_trips_global_circuit_breaker(respx_mock, tmp_path) -> None:
         httpx.AsyncClient(), db=db, breaker=breaker, retry_delays_s=[0.0, 0.0, 0.0]
     )
     async with bili:
-        # 单次搜索：-412 重试 3 次（retries=2），第 3 次触发熔断暂停 60s，随后失败
+        # 单次搜索：-412 初次 + 3 次重试共 4 次尝试（F4-2），第 3 次触发熔断暂停 60s
         with pytest.raises(BiliError):
             await bili.search_videos("歌3 艺3")
 
@@ -1243,3 +1247,156 @@ def test_cli_uses_project_root_regardless_of_cwd(tmp_path, monkeypatch) -> None:
     assert not (cwd_dir / "credentials.db").exists()
     assert not (cwd_dir / "output").exists()
     assert not (cwd_dir / "logs").exists()
+
+
+# ---- F4-1（§7 末句）：run/resume 客户端构造全量 config 接线 -----------
+
+
+def _install_client_spies(monkeypatch, captured: dict) -> None:
+    """包装 httpx.AsyncClient 与 main.BiliSearchClient，捕获构造 kwargs。
+
+    子类调原始构造器：respx 的 transport 级拦截与 async with 生命周期不受影响。
+    """
+    import main as main_mod
+
+    orig_async_client = httpx.AsyncClient
+    orig_bili = main_mod.BiliSearchClient
+
+    class _SpyAsyncClient(orig_async_client):
+        def __init__(self, *args, **kwargs):
+            captured["clients"].append(kwargs)
+            super().__init__(*args, **kwargs)
+
+    class _SpyBili(orig_bili):
+        def __init__(self, *args, **kwargs):
+            captured["bili"].append(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _SpyAsyncClient)
+    monkeypatch.setattr(main_mod, "BiliSearchClient", _SpyBili)
+
+
+def _assert_clients_wired(captured: dict, *, timeout_s: float, wbi_ttl_s: int,
+                          delays: list[float]) -> dict:
+    """断言 3 个 AsyncClient 与 BiliSearchClient 的构造参数（F4-1）。"""
+    client_kws = captured["clients"]
+    assert len(client_kws) == 3, f"应有 ncm/bili/http 三个 client，实际 {len(client_kws)}"
+    for kw in client_kws:
+        timeout = kw.get("timeout")
+        assert isinstance(timeout, httpx.Timeout), f"缺少 timeout 接线: {kw}"
+        assert timeout.read == timeout_s and timeout.connect == timeout_s
+
+    assert len(captured["bili"]) == 1
+    kw = captured["bili"][0]
+    assert kw["wbi_ttl_s"] == wbi_ttl_s, f"wbi_ttl_s 未接线: {kw.get('wbi_ttl_s')}"
+    assert kw["retry_delays_s"] == delays, f"retry_delays_s 未接线: {kw.get('retry_delays_s')}"
+    # F4-4：cred_db 独立于 cache.db，指向 credentials.db
+    cred_db = kw["cred_db"]
+    assert cred_db is not kw["db"]
+    from pathlib import Path as _Path
+
+    assert _Path(cred_db.path).name == "credentials.db"
+    assert _Path(kw["db"].path).name == "cache.db"
+    return kw
+
+
+def test_run_clients_wired_from_config(respx_mock, tmp_path, monkeypatch) -> None:
+    """F4-1 验收（run 路径）：3 个 AsyncClient 传 config.http.timeout_s；
+    BiliSearchClient 传 wbi_ttl_s / retry_delays_s（默认 15 / 86400 / [2,4,8]）；
+    改 config（env 覆盖）后构造参数跟随；buvid3 落 credentials.db（F4-4 联验）。"""
+    import contextlib
+    import io
+
+    import main as main_mod
+    from main import main
+
+    monkeypatch.setattr(main_mod, "_PROJECT_ROOT", tmp_path)
+    captured: dict = {"clients": [], "bili": []}
+    _install_client_spies(monkeypatch, captured)
+
+    # 构造参数仍走真实 config；仅屏蔽限速/退避的真实等待
+    async def _fake_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    _mock_ncm_playlist(respx_mock)
+    _mock_bili_env(respx_mock)
+    respx_mock.get(SEARCH_URL).mock(side_effect=_ok_video_handler)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        main(["run", "1", "--dry-run"])
+
+    _assert_clients_wired(
+        captured, timeout_s=15.0, wbi_ttl_s=86400, delays=[2.0, 4.0, 8.0]
+    )
+    # F4-4 联验：buvid3 已持久化到 tmp/credentials.db
+    cred_db = Database(tmp_path / "credentials.db")
+    row = cred_db.query_one("SELECT value FROM credentials WHERE key = 'buvid3'")
+    assert row is not None and row["value"] == "M4-INTEGRATION-B3"
+    cred_db.close()
+
+    # env 覆盖 config → 第二次 run 的构造参数跟随变化（不硬编码）
+    captured["clients"].clear()
+    captured["bili"].clear()
+    monkeypatch.setenv("NCM2BILI_HTTP__TIMEOUT_S", "33")
+    monkeypatch.setenv("NCM2BILI_CACHE__WBI_KEYS_TTL_S", "777")
+    monkeypatch.setenv("NCM2BILI_RISK_CONTROL__RETRY__INITIAL_DELAY_S", "1")
+    monkeypatch.setenv("NCM2BILI_RISK_CONTROL__RETRY__BACKOFF_FACTOR", "3")
+    monkeypatch.setenv("NCM2BILI_RISK_CONTROL__RETRY__MAX_RETRIES", "2")
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        main(["run", "2", "--dry-run"])
+
+    _assert_clients_wired(
+        captured, timeout_s=33.0, wbi_ttl_s=777, delays=[1.0, 3.0]
+    )
+
+
+def test_resume_clients_wired_from_config(respx_mock, tmp_path, monkeypatch) -> None:
+    """F4-1 验收（resume 路径）：与 run 同款接线——timeout=15、wbi=86400、[2,4,8]。
+
+    用全部 DONE 的任务：resume 阶段一照常抓歌单（走 ncm client），阶段二/三零工作量，
+    不触发 cookie 读取，构造参数仍可在命令入口处捕获。
+    """
+    import contextlib
+    import io
+
+    import main as main_mod
+    from main import main
+
+    monkeypatch.setattr(main_mod, "_PROJECT_ROOT", tmp_path)
+    captured: dict = {"clients": [], "bili": []}
+    _install_client_spies(monkeypatch, captured)
+
+    # 1 首歌的歌单
+    one_song = [SONGS[0]]
+    respx_mock.get(PLAYLIST_URL).mock(
+        return_value=httpx.Response(
+            200, json={"code": 200, "playlist": {"trackIds": [{"id": one_song[0]["id"]}]}}
+        )
+    )
+    respx_mock.post(SONG_DETAIL_URL).mock(
+        return_value=httpx.Response(200, json={"code": 200, "songs": one_song})
+    )
+    _mock_bili_env(respx_mock)
+    respx_mock.get(SEARCH_URL).mock(side_effect=_ok_video_handler)
+
+    # 预置 RUNNING 任务 + 已 DONE 的歌（resume 跳过，不发搜索）
+    db = Database(tmp_path / "cache.db")
+    tid = db.create_task(321)
+    db.upsert_song(
+        "歌1|艺1", task_id=tid, ncm_id=1, name="歌1", artist="艺1",
+        status="DONE", method="SCORED", bvid="BV1done",
+    )
+    db.close()
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        main(["task", "resume", tid, "--yes"])
+
+    _assert_clients_wired(
+        captured, timeout_s=15.0, wbi_ttl_s=86400, delays=[2.0, 4.0, 8.0]
+    )
+    # 已 DONE 的歌零搜索（接线验证不依赖副作用，顺带守住 resume 跳过语义）
+    search_calls = [c for c in respx_mock.calls if "search/type" in str(c.request.url)]
+    assert search_calls == []

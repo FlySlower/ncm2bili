@@ -44,8 +44,7 @@ _NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 # ---- 文档 §9.3 幂等三分支判定码 --------------------------------------
 # 确认日期：2026-09-21（以实测为准，如后续实测到专有"已在夹中" code 在此补充）。
 # 当前按公开实现与实测经验：重复添加同一视频返回 code 0（幂等成功），
-# 与首次收藏成功同码，均视为 DONE。
-ALREADY_IN_FOLDER_CODES: frozenset[int] = frozenset({0})
+# 与首次收藏成功同码，均视为 DONE（F4-5：code 0 即唯一成功码，无需额外集合）。
 # 视频不存在/被删（文档 §9.3 示例）
 VIDEO_NOT_FOUND_CODES: frozenset[int] = frozenset({-404, 62002})
 # 认证失效（文档 §9.2）：立即中止，不做退避重试
@@ -129,6 +128,14 @@ class BiliFavClient:
         if self._breaker is None:
             return 1.0
         return self._breaker.concurrency_multiplier
+
+    @property
+    def slowdown_multiplier(self) -> float:
+        """-702 自适应降速倍率（§7 响应层 b：连续 2 次 -702 翻倍，上限 4x）。
+
+        F4-5：fav_songs worker 经此公开属性读取，不再访问客户端私有属性。
+        """
+        return self._slowdown_multiplier
 
     @staticmethod
     def _mid_from_cookie(cookies: dict[str, str]) -> int | None:
@@ -303,13 +310,30 @@ class BiliFavClient:
             raise FavError(f"建夹失败 {title}: code {data.get('code')}")
         return int(data["data"]["id"])
 
+    def matched_song_ordinals(self, task_id: str) -> dict[str, int]:
+        """F1-3（§5.3）/F4-5：按 song_key 排序查询任务全部已匹配歌曲，
+        返回 {song_key: ordinal} 稳定分段映射（供 fav_songs 按序连续分段）。
+
+        并发下歌曲插入序不确定，须显式按 song_key 排序保证同一首歌恒进原夹。
+        """
+        rows = self._db.query(
+            "SELECT song_key FROM songs WHERE task_id = ? AND bvid IS NOT NULL "
+            "AND status IN ('DONE','MATCHED','FAV_FAILED') ORDER BY song_key",
+            (task_id,),
+        )
+        return {r["song_key"]: i for i, r in enumerate(rows)}
+
     async def ensure_folders(self, playlist_name: str, total: int) -> list[int]:
         """按 900/夹拆分并确保收藏夹存在，返回各夹 media_id 列表。
 
         重跑时按名称查询复用已有同名夹，不为同一任务重复建夹（文档 §5.3）。
+        F4-5：total<=0（无可收藏歌）直接返回空列表，不发 list_folders 请求、
+        不建空夹。
         """
+        if total <= 0:
+            return []
         limit = self._config.fav.per_folder_limit
-        count = math.ceil(total / limit) if total > 0 else 1
+        count = math.ceil(total / limit)
         existing = {f["title"]: int(f["id"]) for f in await self.list_folders()}
         media_ids: list[int] = []
         for index in range(1, count + 1):
@@ -386,15 +410,12 @@ class BiliFavClient:
             return {"status": "FAV_FAILED", "bvid": bvid, "fail_reason": reason}
         code = data.get("code")
 
-        if code == 0 or code in ALREADY_IN_FOLDER_CODES:
-            # 已收藏视为成功（文档 §9.3）
+        if code == 0:
+            # code 0：收藏成功（含重复添加的幂等成功，文档 §9.3）。
+            # F3-2/F4-5：upsert_song 转 DONE 时强制 fail_reason=NULL（db 白名单
+            # 语义），无需再手动 UPDATE 清因
             self._db.upsert_song(
                 key, task_id=task_id, status="DONE", method=song.get("method"), bvid=bvid
-            )
-            # 收藏成功：清空历史 fail_reason（upsert_song 跳过 None 字段，需显式 UPDATE）
-            self._db.execute(
-                "UPDATE songs SET fail_reason = NULL WHERE song_key = ? AND task_id = ?",
-                (key, task_id),
             )
             logger.info("收藏成功 %s → %s", key, bvid)
             return {"status": "DONE", "bvid": bvid}
@@ -431,7 +452,6 @@ def _parse_cookies(cookie_str: str) -> dict[str, str]:
 
 async def fav_songs(
     client: BiliFavClient,
-    db: Database,
     config: Config,
     songs: list[dict],
     playlist_name: str,
@@ -444,6 +464,9 @@ async def fav_songs(
     禁止轮转；resume 建夹数量按任务总匹配数计算，保证歌进原夹。断点映射按
     song_key 排序定序（并发插入序不确定，须显式排序稳定映射）。
 
+    F4-5：去掉死参数 db——ordinal 映射经 client.matched_song_ordinals() 公开
+    方法读取，降速倍率经 client.slowdown_multiplier 公开属性读取。
+
     Args:
         media_ids: 预分配的收藏夹 media_id 列表；None 时按任务总匹配数自动建夹。
     """
@@ -455,12 +478,7 @@ async def fav_songs(
 
     # F1-3（§5.3）：按 song_key 排序查询全任务匹配数，建立稳定 ordinal 映射。
     # 并发下 songs 插入序不确定，须显式排序保证断点映射稳定（同一首歌恒进原夹）。
-    rows = db.query(
-        "SELECT song_key FROM songs WHERE task_id = ? AND bvid IS NOT NULL "
-        "AND status IN ('DONE','MATCHED','FAV_FAILED') ORDER BY song_key",
-        (task_id,),
-    )
-    ordinal = {r["song_key"]: i for i, r in enumerate(rows)}
+    ordinal = client.matched_song_ordinals(task_id)
     total_matched = len(ordinal)
 
     if media_ids is None:
@@ -486,11 +504,11 @@ async def fav_songs(
         async with sem:
             # 文档 §7 预防层 + -702 自适应降速（interval × 客户端乘数，上限 4x）
             # F3-7（§7 响应层 b）：再除以熔断降并发倍率——critical 后
-            # multiplier=0.5，间隔再翻倍；与 _slowdown_multiplier 相乘叠加：
+            # multiplier=0.5，间隔再翻倍；与 slowdown_multiplier 相乘叠加：
             # 最终间隔 = base × slowdown × 1/concurrency_multiplier。
             interval_ms = (
                 rl.interval_ms
-                * client._slowdown_multiplier
+                * client.slowdown_multiplier
                 / client.concurrency_multiplier
             )
             jitter_lo, jitter_hi = rl.jitter_ms
@@ -507,7 +525,6 @@ async def fav_songs(
 
 
 __all__ = [
-    "ALREADY_IN_FOLDER_CODES",
     "AUTH_EXPIRED_CODES",
     "AuthExpiredError",
     "BiliFavClient",

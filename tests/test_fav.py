@@ -194,6 +194,26 @@ async def test_rerun_reuses_existing_folder_media_id(tmp_path) -> None:
     assert add_calls == []
 
 
+@pytest.mark.asyncio
+@respx.mock
+async def test_ensure_folders_zero_total_skips_requests(tmp_path) -> None:
+    """F4-5（纯重构）：total=0 直接返回 []，不查夹/不建夹（零请求、零空夹）。"""
+    db = Database(tmp_path / "t.db")
+
+    def _boom(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"total=0 不应发出任何请求，实际命中 {request.url}")
+
+    respx.get(FOLDER_LIST_URL).mock(side_effect=_boom)
+    respx.post(FOLDER_ADD_URL).mock(side_effect=_boom)
+
+    client = _client(db)
+    async with client._client:
+        media_ids = await client.ensure_folders("空歌单", 0)
+
+    assert media_ids == []
+    assert respx.calls == []
+
+
 # ---- 验收 3：-101 立即中止且不清断点 ----------------------------------
 
 
@@ -256,7 +276,7 @@ async def test_fav_songs_batch(tmp_path) -> None:
     songs = [_song(f"歌{i}|艺{i}", f"BV1x{i}") for i in range(10)]
     client = _client(db)
     async with client._client:
-        summary = await fav_songs(client, db, Config(), songs, "批量歌单")
+        summary = await fav_songs(client, Config(), songs, "批量歌单")
 
     assert summary["total"] == 10
     assert summary["statuses"]["DONE"] == 10
@@ -318,7 +338,7 @@ async def test_fav_songs_sequential_segmentation_no_roundrobin(tmp_path) -> None
     cfg.rate_limit.fav.jitter_ms = [0, 0]
     client = _client(db, cfg)
     async with client._client:
-        summary = await fav_songs(client, db, cfg, songs, "歌单")
+        summary = await fav_songs(client, cfg, songs, "歌单")
 
     assert summary["total"] == 5
     assert summary["statuses"]["DONE"] == 5
@@ -388,7 +408,7 @@ async def test_fav_songs_resume_uses_total_matched_for_folders(tmp_path) -> None
     cfg.rate_limit.fav.jitter_ms = [0, 0]
     client = _client(db, cfg)
     async with client._client:
-        summary = await fav_songs(client, db, cfg, songs, "歌单")
+        summary = await fav_songs(client, cfg, songs, "歌单")
 
     assert summary["total"] == 2
     assert summary["statuses"]["DONE"] == 2
@@ -652,9 +672,9 @@ async def test_minus702_consecutive_trips_slowdown(tmp_path, monkeypatch) -> Non
         result = await client.fav_one(1, _song())
 
     assert result["status"] == "DONE"
-    # 连续 2 次 -702 → interval 乘数 x2（上限 x4）
-    assert client._slowdown_multiplier == 2.0
-    assert client._slowdown_multiplier <= RATE_LIMIT_MAX_MULTIPLIER
+    # 连续 2 次 -702 → interval 乘数 x2（上限 x4）；F4-5：经公开 property 读取
+    assert client.slowdown_multiplier == 2.0
+    assert client.slowdown_multiplier <= RATE_LIMIT_MAX_MULTIPLIER
 
 
 @pytest.mark.asyncio
@@ -689,7 +709,8 @@ async def test_minus702_retry_exhausted_records_reason(tmp_path, monkeypatch) ->
     assert row is not None and row["fail_reason"]  # fail_reason 已落
     assert row["status"] == "FAV_FAILED"  # 与内存返回值一致
     # 连续 -702 已触发自适应降速（重试耗尽后计数重置，但乘数保留）
-    assert client._slowdown_multiplier > 1.0
+    # F4-5：经公开 property 读取
+    assert client.slowdown_multiplier > 1.0
 
 
 # ---- 收藏阶段接入全局熔断器（文档 §7 响应层 b）-------------------------
@@ -794,7 +815,7 @@ async def test_critical_breaker_halves_fav_request_rate(tmp_path) -> None:
         )
         async with client._client:
             t0 = _time.perf_counter()
-            summary = await fav_songs(client, db, cfg, songs, "歌单")
+            summary = await fav_songs(client, cfg, songs, "歌单")
             elapsed = _time.perf_counter() - t0
         assert summary["statuses"].get("DONE") == 4
         return elapsed

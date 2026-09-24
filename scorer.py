@@ -7,14 +7,16 @@
 """
 from __future__ import annotations
 
+import asyncio
 import math
+import random
 import time
 from contextlib import suppress
 from typing import Any
 
 import httpx
 
-from config import ScoringConfig
+from config import RateLimitSection, ScoringConfig
 from db import Database
 
 # 文档 §5.2 阶段二接口
@@ -141,12 +143,18 @@ async def rank_candidates(
     config: ScoringConfig,
     http_client: httpx.AsyncClient | None,
     db: Database | None,
+    *,
+    rate_limit: RateLimitSection | None = None,
 ) -> list[dict]:
     """文档 §4.2 两阶段排序。
 
     - 先阶段一打分取 top3（config.top_n_stage2）；
     - top1 与 top2 差值比例 >= stage2_diff_threshold → 差值明显，直接返回（0 额外请求）；
     - 差值接近 → 补调 view/relation，营销号沉底后按分数排序。
+
+    F4-3（文档 §7 预防层）：rate_limit 传入时阶段二补查不再裸发请求——每个
+    候选补查前 sleep = interval_ms + uniform(jitter_ms)，并以 Semaphore
+    (concurrency) 封顶并发；None 时不限速（保留直接调用的测试/兼容路径）。
     """
     for cand in candidates:
         cand["score"] = stage1_score(cand, song_name, config)
@@ -159,11 +167,28 @@ async def rank_candidates(
         return top  # 差值明显：不发 view/relation 请求
     if http_client is None:
         return top
-    for cand in top:
+
+    # F4-3（§7 预防层）：阶段二补查独立限速——每候选补查前 interval+jitter，
+    # 并发上限 rate_limit.concurrency（config.rate_limit.stage2 由 matcher 传入）
+    sem = asyncio.Semaphore(rate_limit.concurrency) if rate_limit is not None else None
+
+    async def _enrich(cand: dict) -> None:
+        if sem is not None:
+            async with sem:
+                await asyncio.sleep(
+                    (rate_limit.interval_ms + random.uniform(*rate_limit.jitter_ms)) / 1000
+                )
+                await _fetch_pair(cand)
+        else:
+            await _fetch_pair(cand)
+
+    async def _fetch_pair(cand: dict) -> None:
         with suppress(httpx.HTTPError):
             cand["view_detail"] = await _fetch_view(http_client, cand["bvid"])
         with suppress(httpx.HTTPError, KeyError):
             cand["follower"] = await fetch_follower_cached(http_client, db, cand["mid"])
+
+    await asyncio.gather(*(_enrich(cand) for cand in top))
     # 精排：营销号（粉丝极少）沉底，其余按阶段一分数降序
     top.sort(
         key=lambda c: (

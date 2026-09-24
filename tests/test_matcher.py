@@ -84,16 +84,22 @@ def _mock_env(respx_mock) -> None:
 
 
 def _fast_cfg() -> Config:
-    """测试用 Config：搜索限速归零，避免 F1-1 下沉的 sleep 拖慢用例。"""
+    """测试用 Config：搜索/阶段二限速归零，避免 F1-1/F4-3 下沉的 sleep 拖慢用例。"""
     cfg = Config()
     cfg.rate_limit.search.interval_ms = 0
     cfg.rate_limit.search.jitter_ms = [0, 0]
+    # F4-3（§7 预防层）：matcher 把 rate_limit.stage2 传入 rank_candidates，
+    # 触发阶段二补查的用例（如 margin 闸门参数对）同步归零
+    cfg.rate_limit.stage2.interval_ms = 0
+    cfg.rate_limit.stage2.jitter_ms = [0, 0]
     return cfg
 
 
 def _make_matcher(db: Database, **kwargs) -> Matcher:
     cfg = _fast_cfg()
-    bili = BiliSearchClient(httpx.AsyncClient(), db=db)
+    # F4-2：尝试次数按退避序列长度推导（默认共 4 次尝试）；测试注零退避，
+    # 避免搜索失败路径真实 sleep 2s→4s→8s
+    bili = BiliSearchClient(httpx.AsyncClient(), db=db, retry_delays_s=[0.0, 0.0, 0.0])
     ncm = NcmClient(httpx.AsyncClient())
     http = httpx.AsyncClient()
     return Matcher(cfg, db, bili, ncm, http, **kwargs)

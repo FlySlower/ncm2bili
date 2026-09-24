@@ -136,6 +136,52 @@ async def test_stage2_gap_close_calls_view_relation(respx_mock) -> None:
 
 
 @pytest.mark.asyncio
+async def test_stage2_rate_limit_sleeps_and_follows_config(
+    respx_mock, monkeypatch,
+) -> None:
+    """F4-3（§7 预防层）：阶段二补查前按 rate_limit.stage2 sleep（interval+jitter），
+    时长随 config 变化；补查请求照常发出（非裸发：每候选先限速）。"""
+    import scorer
+    from config import RateLimitSection
+
+    respx_mock.get(VIEW_URL).mock(return_value=_ok(like=1))
+    respx_mock.get(RELATION_URL).mock(return_value=_ok(follower=1000))
+
+    candidates_factory = lambda: [  # noqa: E731 - 测试夹具：两次运行各用一份（带 score 缓存）
+        _video(bvid="BV1a", play=1_000, favorites=100, reply=10, title="夜曲 官方版", mid=1),
+        _video(bvid="BV2b", play=980, favorites=98, reply=9, title="夜曲 官方现场", mid=2),
+    ]
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(scorer.asyncio, "sleep", fake_sleep)
+
+    client = httpx.AsyncClient()
+    async with client:
+        # interval=500ms + jitter 固定 0 → 每候选补查前睡 0.5s
+        rl = RateLimitSection(concurrency=4, interval_ms=500, jitter_ms=[0, 0])
+        ranked = await rank_candidates(
+            candidates_factory(), "夜曲", Config().scoring, client, None, rate_limit=rl
+        )
+        assert len(ranked) == 2
+        assert len(respx_mock.calls) == 4  # 2 候选 × (view + relation) 仍照常补查
+        assert sorted(sleeps) == [0.5, 0.5]  # 每个候选补查前 sleep 一次
+
+        # config 变化 → sleep 时长跟随（interval=1000ms）
+        sleeps.clear()
+        respx_mock.calls.clear()
+        rl2 = RateLimitSection(concurrency=1, interval_ms=1000, jitter_ms=[0, 0])
+        await rank_candidates(
+            candidates_factory(), "夜曲", Config().scoring, client, None, rate_limit=rl2
+        )
+        assert len(respx_mock.calls) == 4
+        assert sorted(sleeps) == [1.0, 1.0]
+
+
+@pytest.mark.asyncio
 async def test_stage2_follower_cached_by_mid(respx_mock, tmp_path) -> None:
     """同一 mid 的粉丝数只查一次 relation（uploader_cache 缓存）。"""
     from db import Database
