@@ -28,6 +28,7 @@ def test_create_all_seven_tables(tmp_path) -> None:
             "bvid",
             "score_detail",
             "fail_reason",
+            "ordinal",  # V5-P1-4（§5.3）：歌单内序号
             "updated_at",
         ]
 
@@ -442,5 +443,92 @@ def test_upsert_song_omit_bvid_keeps_history(tmp_path) -> None:
                        fail_reason="收藏失败（code -404）")
         row = db.query_one("SELECT bvid FROM songs WHERE song_key = '歌|艺'")
         assert row["bvid"] == "BV1keep"
+    finally:
+        db.close()
+
+
+# ---- V5-P1-4（§5.3）：ordinal 列迁移与持久化 --------------------------
+
+
+def test_ordinal_migration_from_v04(tmp_path) -> None:
+    """V5-P1-4：老库（v0.4，有 task_id 但无 ordinal）打开后自动加列并兜底赋序。
+
+    兜底赋序按 task_id 分组、song_key 排序赋 0..N-1（与旧 song_key 排序行为一致，
+    不改变已有分段归属）。
+    """
+    import sqlite3
+
+    path = tmp_path / "v04.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE songs (
+          song_key TEXT, task_id TEXT, ncm_id INTEGER, name TEXT, artist TEXT,
+          album TEXT, alia TEXT, origin TEXT, status TEXT, method TEXT,
+          bvid TEXT, score_detail TEXT, fail_reason TEXT, updated_at INTEGER,
+          PRIMARY KEY (song_key, task_id)
+        );
+        CREATE TABLE tasks (
+          task_id TEXT PRIMARY KEY, playlist_id TEXT, status TEXT,
+          created_at INTEGER, finished_at INTEGER, stats TEXT
+        );
+        CREATE TABLE search_cache (
+          keyword TEXT PRIMARY KEY, results TEXT, fetched_at INTEGER
+        );
+        CREATE TABLE uploader_cache (
+          mid INTEGER PRIMARY KEY, followers INTEGER, fetched_at INTEGER
+        );
+        CREATE TABLE whitelist_bv (
+          song_key TEXT PRIMARY KEY, bvid TEXT, source TEXT
+        );
+        CREATE TABLE credentials (
+          key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER
+        );
+        CREATE TABLE kv_meta (
+          key TEXT PRIMARY KEY, value TEXT, fetched_at INTEGER
+        );
+        INSERT INTO tasks (task_id, playlist_id, status, created_at)
+        VALUES ('t1', '123', 'DONE', 1);
+        INSERT INTO songs (song_key, task_id, name, status, method, bvid, updated_at)
+        VALUES
+          ('歌C|艺C', 't1', '歌C', 'DONE', 'SCORED', 'BVc', 1),
+          ('歌A|艺A', 't1', '歌A', 'DONE', 'SCORED', 'BVa', 1),
+          ('歌B|艺B', 't1', '歌B', 'DONE', 'SCORED', 'BVb', 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    try:
+        # ordinal 列已添加
+        cols = [r["name"] for r in db.query("PRAGMA table_info(songs)")]
+        assert "ordinal" in cols
+        # 兜底赋序：按 song_key 排序 → 歌A=0, 歌B=1, 歌C=2
+        rows = db.query(
+            "SELECT song_key, ordinal FROM songs WHERE task_id = 't1' ORDER BY ordinal"
+        )
+        assert [(r["song_key"], r["ordinal"]) for r in rows] == [
+            ("歌A|艺A", 0),
+            ("歌B|艺B", 1),
+            ("歌C|艺C", 2),
+        ]
+    finally:
+        db.close()
+
+
+def test_ordinal_persisted_and_not_overwritten(tmp_path) -> None:
+    """V5-P1-4：upsert_song 传入 ordinal 后持久化；后续不传 ordinal 的 upsert 不覆盖。"""
+    db = Database(tmp_path / "test.db")
+    try:
+        # 首次写入：传入 ordinal=5
+        db.upsert_song("歌|艺", task_id="t1", status="PENDING", ordinal=5)
+        row = db.query_one("SELECT ordinal FROM songs WHERE song_key = '歌|艺'")
+        assert row["ordinal"] == 5
+        # 后续 upsert 不传 ordinal → 不覆盖
+        db.upsert_song("歌|艺", task_id="t1", status="MATCHED", method="SCORED", bvid="BV1")
+        row = db.query_one("SELECT ordinal, status FROM songs WHERE song_key = '歌|艺'")
+        assert row["ordinal"] == 5  # ordinal 保持
+        assert row["status"] == "MATCHED"
     finally:
         db.close()

@@ -713,6 +713,97 @@ async def test_minus702_retry_exhausted_records_reason(tmp_path, monkeypatch) ->
     assert client.slowdown_multiplier > 1.0
 
 
+# ---- V5-P1-4/V5-P1-5（§5.3）：ordinal 持久化与分段稳定性 -------------
+
+
+def test_matched_song_ordinals_by_ordinal_not_song_key(tmp_path) -> None:
+    """V5-P1-4：matched_song_ordinals 按 ordinal 排序，而非 song_key 字典序。
+
+    乱序 song_key 的歌单（歌3、歌1、歌2 按 ordinal 0、1、2 分配），
+    matched_song_ordinals 返回 {歌3:0, 歌1:1, 歌2:2}（歌单顺序），
+    而非旧的 {歌1:0, 歌2:1, 歌3:2}（字典序）。
+    """
+    db = Database(tmp_path / "t.db")
+    try:
+        tid = "t-ord"
+        db.create_task(123)
+        # 按 ordinal 0,1,2 插入（歌单顺序：歌3, 歌1, 歌2）
+        db.upsert_song("歌3|艺3", task_id=tid, status="MATCHED", method="SCORED",
+                       bvid="BV3", ordinal=0)
+        db.upsert_song("歌1|艺1", task_id=tid, status="MATCHED", method="SCORED",
+                       bvid="BV1", ordinal=1)
+        db.upsert_song("歌2|艺2", task_id=tid, status="MATCHED", method="SCORED",
+                       bvid="BV2", ordinal=2)
+
+        client = _client(db)
+        ordinal = client.matched_song_ordinals(tid)
+        # 按 ordinal 排序：歌3=0, 歌1=1, 歌2=2（歌单顺序，非字典序）
+        assert ordinal == {"歌3|艺3": 0, "歌1|艺1": 1, "歌2|艺2": 2}
+    finally:
+        db.close()
+
+
+def test_folder_assignment_stable_after_growth(tmp_path) -> None:
+    """V5-P1-4/V5-P1-5：回灌增长后原歌 ordinal 不变、夹归属不漂移。
+
+    场景：首轮 3 首歌（ordinal 0-2），per_folder_limit=2 → 夹分配 [夹0,夹0,夹1]。
+    回灌 2 首新歌（ordinal 3-4）后，5 首 ordinal 映射不变——
+    原 3 首夹归属不变（歌0→夹0, 歌1→夹0, 歌2→夹1），新 2 首接续分段（歌3→夹1, 歌4→夹2）。
+    旧 song_key 字典序行为下，增长后 ordinal 重映射会导致 40% 漂移。
+    """
+    db = Database(tmp_path / "t.db")
+    tid = "t-grow"
+    try:
+        db.create_task(123)
+        # 首轮 3 首，ordinal 0-2
+        for i in range(3):
+            db.upsert_song(
+                f"歌{i}|艺{i}", task_id=tid, status="DONE", method="SCORED",
+                bvid=f"BV{i}", ordinal=i,
+            )
+    finally:
+        db.close()
+
+    cfg = Config()
+    cfg.fav.per_folder_limit = 2  # 小 limit 测分段
+    cfg.rate_limit.fav.interval_ms = 0
+    cfg.rate_limit.fav.jitter_ms = [0, 0]
+
+    # 首轮：3 首 DONE，ordinal 映射
+    db = Database(tmp_path / "t.db")
+    try:
+        client = _client(db, cfg)
+        ordinal_before = client.matched_song_ordinals(tid)
+        # 歌0→ordinal 0→夹0, 歌1→ordinal 1→夹0, 歌2→ordinal 2→夹1
+        assert ordinal_before == {"歌0|艺0": 0, "歌1|艺1": 1, "歌2|艺2": 2}
+    finally:
+        db.close()
+
+    # 回灌 2 首新歌（ordinal 3-4），状态 MATCHED 待收藏
+    db = Database(tmp_path / "t.db")
+    try:
+        db.upsert_song("歌3|艺3", task_id=tid, status="MATCHED", method="SCORED",
+                       bvid="BV3", ordinal=3)
+        db.upsert_song("歌4|艺4", task_id=tid, status="MATCHED", method="SCORED",
+                       bvid="BV4", ordinal=4)
+    finally:
+        db.close()
+
+    # 增长后 ordinal 映射不变——原 3 首夹归属不漂移
+    db = Database(tmp_path / "t.db")
+    try:
+        client = _client(db, cfg)
+        ordinal_after = client.matched_song_ordinals(tid)
+        # 原 3 首 ordinal 不变（0,1,2），新 2 首接续（3,4）
+        assert ordinal_after["歌0|艺0"] == 0
+        assert ordinal_after["歌1|艺1"] == 1
+        assert ordinal_after["歌2|艺2"] == 2
+        assert ordinal_after["歌3|艺3"] == 3
+        assert ordinal_after["歌4|艺4"] == 4
+    finally:
+        db.close()
+
+
 # ---- 收藏阶段接入全局熔断器（文档 §7 响应层 b）-------------------------
 
 

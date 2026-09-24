@@ -244,6 +244,141 @@ def test_server_rejects_oversized_song_key(tmp_path) -> None:
     assert not manual_path.exists()
 
 
+# ---- V5-P0-1（§10.3 意图）：GET 托管页面 + OPTIONS + CORS -------------
+
+
+def _get_page(server, path: str) -> httpx.Response:
+    """GET 请求 review_server（httpx 同步）。"""
+    port = server.server_address[1]
+    with httpx.Client() as client:
+        return client.get(f"http://127.0.0.1:{port}{path}", timeout=5)
+
+
+def _options(server, path: str = "/save") -> httpx.Response:
+    """OPTIONS 请求 review_server。"""
+    port = server.server_address[1]
+    with httpx.Client() as client:
+        return client.options(
+            f"http://127.0.0.1:{port}{path}", timeout=5,
+            headers={"Origin": f"http://127.0.0.1:{port}"},
+        )
+
+
+def test_get_serves_review_html_with_valid_token(tmp_path) -> None:
+    """V5-P0-1 验收：GET /review.html?token=<token> → 200 且内容为 review.html。"""
+    from report import write_review_html
+
+    review_path = tmp_path / "review.html"
+    write_review_html(
+        [_manual_song("夜曲|周杰伦", "夜曲", "周杰伦")],
+        review_path, save_url="http://127.0.0.1:0/save", token="dummy",
+    )
+    expected_content = review_path.read_bytes()
+
+    server, port, token = serve_in_background(
+        tmp_path / "manual.json", review_html_path=review_path,
+    )
+    try:
+        r = _get_page(server, f"/review.html?token={token}")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert r.status_code == 200
+    assert r.headers["Content-Type"].startswith("text/html")
+    assert r.content == expected_content
+
+
+def test_get_rejects_missing_token(tmp_path) -> None:
+    """V5-P0-1：GET /review.html 无 token 查询参数 → 403。"""
+    review_path = tmp_path / "review.html"
+    review_path.write_text("<html>dummy</html>", encoding="utf-8")
+
+    server, port, token = serve_in_background(
+        tmp_path / "manual.json", review_html_path=review_path,
+    )
+    try:
+        r = _get_page(server, "/review.html")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert r.status_code == 403
+
+
+def test_get_rejects_wrong_token(tmp_path) -> None:
+    """V5-P0-1：GET /review.html?token=wrong → 403。"""
+    review_path = tmp_path / "review.html"
+    review_path.write_text("<html>dummy</html>", encoding="utf-8")
+
+    server, port, token = serve_in_background(
+        tmp_path / "manual.json", review_html_path=review_path,
+    )
+    try:
+        r = _get_page(server, "/review.html?token=wrongtoken")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert r.status_code == 403
+
+
+def test_get_rejects_wrong_path(tmp_path) -> None:
+    """V5-P0-1：GET 非 /review.html 路径 → 404。"""
+    review_path = tmp_path / "review.html"
+    review_path.write_text("<html>dummy</html>", encoding="utf-8")
+
+    server, port, token = serve_in_background(
+        tmp_path / "manual.json", review_html_path=review_path,
+    )
+    try:
+        r = _get_page(server, f"/other.html?token={token}")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert r.status_code == 404
+
+
+def test_options_returns_cors_headers_same_origin(tmp_path) -> None:
+    """V5-P0-1：OPTIONS → 200 且带 Access-Control-Allow-* 头（同源限定）。"""
+    server, port, token = serve_in_background(tmp_path / "manual.json")
+    try:
+        r = _options(server)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert r.status_code == 200
+    assert r.headers.get("Access-Control-Allow-Origin") == f"http://127.0.0.1:{port}"
+    assert "OPTIONS" in r.headers.get("Access-Control-Allow-Methods", "")
+    assert "X-Token" in r.headers.get("Access-Control-Allow-Headers", "")
+
+
+def test_post_still_works_with_get_enabled(tmp_path) -> None:
+    """V5-P0-1 回归：GET 托管启用后 POST /save 合法路径不回退。"""
+    review_path = tmp_path / "review.html"
+    review_path.write_text("<html>dummy</html>", encoding="utf-8")
+    manual_path = tmp_path / "manual.json"
+
+    server, port, token = serve_in_background(
+        manual_path, review_html_path=review_path,
+    )
+    origin = f"http://127.0.0.1:{port}"
+    try:
+        r = _post_json(
+            server, "/save", {"song_key": "夜曲|周杰伦", "bvid": VALID_BV},
+            token=token, origin=origin,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert r.status_code == 200
+    data = load_manual(manual_path)
+    assert data["夜曲|周杰伦"] == VALID_BV
+
+
 # ---- 验收 4：review.html 生成 -----------------------------------------
 
 
@@ -332,6 +467,51 @@ def test_review_html_static_open_save_unavailable_hint(tmp_path) -> None:
     assert "无法连接保存服务" in text
     # SAVE_URL 为空串（fetch("") 走 catch，而非误以为已配置服务）
     assert 'const SAVE_URL = "";' in text
+
+
+# ---- V5-P2-10（§10.2 连带回归修复）：review.html 过滤仅按 status 判定 ----
+
+
+def test_review_html_excludes_done_with_manual_method(tmp_path) -> None:
+    """V5-P2-10：DONE + method=MANUAL 的歌不入 review 列表。
+
+    F2-1 引入"升级后保留 method=MANUAL"后，原 `or method=='MANUAL'` 分支
+    误把 DONE+MANUAL / MATCHED+MANUAL 的歌列入待 review 列表。
+    修复后过滤仅按 status 判定，DONE 不入列。
+    """
+    rows = [
+        _manual_song("夜曲|周杰伦", "夜曲", "周杰伦"),  # status=MANUAL ✓ 入列
+        {"song_key": "晴天|周杰伦", "name": "晴天", "artist": "周杰伦",
+         "status": "DONE", "method": "MANUAL", "bvid": "BV1new", "fail_reason": None},
+    ]
+    path = write_review_html(rows, tmp_path / "review.html", save_url=None)
+    text = path.read_text(encoding="utf-8")
+    assert "夜曲|周杰伦" in text   # status=MANUAL 仍入列
+    assert "晴天|周杰伦" not in text  # DONE+MANUAL 不入列
+
+
+def test_review_html_excludes_matched_with_manual_method(tmp_path) -> None:
+    """V5-P2-10：MATCHED + method=MANUAL 的歌不入 review 列表。"""
+    rows = [
+        _manual_song("夜曲|周杰伦", "夜曲", "周杰伦"),  # status=MANUAL ✓ 入列
+        {"song_key": "单车|陈奕迅", "name": "单车", "artist": "陈奕迅",
+         "status": "MATCHED", "method": "MANUAL", "bvid": "BV1up", "fail_reason": None},
+    ]
+    path = write_review_html(rows, tmp_path / "review.html", save_url=None)
+    text = path.read_text(encoding="utf-8")
+    assert "夜曲|周杰伦" in text   # status=MANUAL 仍入列
+    assert "单车|陈奕迅" not in text  # MATCHED+MANUAL 不入列
+
+
+def test_review_html_status_manual_not_regressed(tmp_path) -> None:
+    """V5-P2-10 回归：status=MANUAL + method=MANUAL 的歌仍入列（语义不回退）。"""
+    rows = [
+        _manual_song("等|陈奕迅", "等", "陈奕迅"),
+    ]
+    path = write_review_html(rows, tmp_path / "review.html", save_url=None)
+    text = path.read_text(encoding="utf-8")
+    assert "等|陈奕迅" in text  # status=MANUAL 入列不受影响
+
 
 
 # ---- 验收 5：端到端 —— manual 按优先级铁律生效 -------------------------

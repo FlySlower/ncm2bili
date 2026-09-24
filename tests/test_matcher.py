@@ -803,6 +803,25 @@ def test_sanitize_never_appends_hardcoded_words() -> None:
     assert "MV" not in sanitize_song_name("一生中最爱(Live)", KEEP_TOKENS)
 
 
+def test_normalize_replaces_punctuation_with_space_not_delete() -> None:
+    """V5-P1-3：_normalize 标点替换为空格而非删除，防 token 粘连。
+
+    `单车(Live)` 归一化后 → `单车 live` → tokens ['单车','live']（而非
+    旧 `单车live` 单 token）；标题 `单车(Live) 演唱会` 含空格时子串
+    判定从 False（误杀）变 True（正确匹配）。
+    """
+    from matcher import _name_tokens, _normalize, _title_contains_all
+
+    # 标点 → 空格，token 不粘连
+    assert _normalize("单车(Live)") == "单车 live"
+    assert _name_tokens("单车(Live)") == ["单车", "live"]
+    # 旧 bug：_normalize 删标点 → '单车live' 单 token，标题含空格时子串 False
+    # 修复后：tokens ['单车','live'] 各自命中标题 → True
+    assert _title_contains_all("单车(Live) 演唱会 陈奕迅", _name_tokens("单车(Live)"))
+    # Constriction2.0：句点替换为空格 → 切分变化但不影响闸门判定（无病例涉及）
+    assert _normalize("Constriction2.0") == "constriction2 0"
+
+
 @pytest.mark.asyncio
 async def test_degrade_keywords_go_through_sanitize_and_templates(respx_mock, tmp_path) -> None:
     """sanitize 无旁路：搜索关键词全部来自 sanitize + degrade 模板，无硬编码追加词。"""
